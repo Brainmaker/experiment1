@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-  ------Sentence Autoencoder------
+  ------ Sentence Autoencoder ------
   Created by Xiaolin Wan, 4.24.2016
+  Last updated in 4.25.2016
 
-  Build a deep sentence autoencoder with Bi-LSTM.
+  Build a deeply sentence autoencoder with Bi-LSTM.
   We adopt a Bi-LSTM structure with four layer for encoding and four layer for decoding,
-  a deep structure is planted between encoder and decoder to extract high-level sentence representation.
+  a deeply structure is planted between encoder and decoder to extract high-level sentence representation.
 
   Draft* Do NOT cite.
 """
@@ -17,68 +18,84 @@ import theano.tensor as tensor
 from theano import config
 
 class SAE:
-    def __init__(self, sae_structure_params, sae_training_params):
+    def __init__(self, sae_struct_params, sae_training_params):
+        # Set the random number generators' seeds for consistency
         SEED = 888
         numpy.random.seed(SEED)
 
-        self.struct_params   = sae_structure_params
+        self.struct_params   = sae_struct_params
         self.training_params = sae_training_params
-
-        self.nn_weights = self.__init_nn_weights() # TODO: initialize with init_sae_params
+        self.nn_weights      = self.__init_nn_weights()
 
 
     def __numpy_floatX(self, data):
         return numpy.asarray(data, dtype=config.floatX)
 
-    def init_params(self):
-        pass
+
+    def __get_ortho_weights(self, hidden_units_dim):
+        tmp = numpy.random.randn(hidden_units_dim, hidden_units_dim)  # 方阵
+        ortho_weight = numpy.linalg.svd(tmp)
+        pp = numpy.concatenate([ortho_weight,ortho_weight,ortho_weight,ortho_weight], axis=1)
+        return pp
+
+
+    def __numpy2theano(self):
+        pass # TODO
+    
+    
+    def __slice(self, _x, n, dim):
+        if _x.ndim == 3:
+            return _x[:, :, n * dim:(n + 1) * dim]
+        return _x[:, n * dim:(n + 1) * dim]
 
 
     def __init_nn_weights(self):
-        hidden_units_dim = self.struct_params['hidden_units_dim']
+        """
+        In this model, Neural network weights includes:
+        Encoder:
+            enc_W[i], enc_W[i], enc_W[i], enc_W[i], enc_b[i]
 
-        def _get_ortho_weight(hidden_units_dim):
-            tmp = numpy.random.randn(hidden_units_dim, hidden_units_dim)
-            ortho_weight = numpy.linalg.svd(tmp)
-            pp = numpy.concatenate([ortho_weight,ortho_weight,ortho_weight,ortho_weight], axis=1)
-            return pp
+        Decoder:
+            dec_W[i], dec_W[i], dec_W[i], dec_W[i], dec_b[i]
 
-        for ww in self.nn_weights['enc_W']:
-            ww = _get_ortho_weight(hidden_units_dim)
-        for uu in self.nn_weights['enc_U']:
-            uu = _get_ortho_weight(hidden_units_dim)
-        for bb in self.nn_weights['enc_b']:
-            bb = numpy.zeros((4 * self.struct_params[''],))
-        for ww in self.nn_weights['dec_W']:
-            ww = _get_ortho_weight(hidden_units_dim)
-        for uu in self.nn_weights['dec_U']:
-            uu = _get_ortho_weight(hidden_units_dim)
-        for bb in self.nn_weights['dec_b']:
-            bb = numpy.zeros((4 * self.struct_params[''],))
-        # TODO: This part of the code will be rewritten
-        return 0
+        Feature Extraction:
+            mlp_W[i], mlp_b[i]
+        """
+        a = {}
+        return a # TODO
 
 
-    def dropout_layer(self, layer_output):
-        return layer_output
+    def __get_dropout_layer(self):
+        pass # TODO
 
 
-    def __lstm_unit(self, x_, m_, h_, c_, lstm_tag):
-
-        layer_num = 0
-
-        def _slice(_x, n, dim):
-            if _x.ndim == 3:
-                return _x[:, :, n * dim:(n + 1) * dim]
-            return _x[:, n * dim:(n + 1) * dim]
-
-        preact = tensor.dot(h_, self.nn_weights[lstm_tag][layer_num])
+    def encoder_lstm_unit(self, x_, m_, h_, c_, n_layer): # TODO: 根据scan()的行为调整参数顺序
+        preact = tensor.dot(h_, self.nn_weights['enc_U'][n_layer])
         preact += x_
 
-        i = tensor.nnet.sigmoid(_slice(preact, 0, self.struct_params['hidden_units_dim']))
-        f = tensor.nnet.sigmoid(_slice(preact, 1, self.struct_params['hidden_units_dim']))
-        o = tensor.nnet.sigmoid(_slice(preact, 2, self.struct_params['hidden_units_dim']))
-        c = tensor.tanh(_slice(preact, 3, self.struct_params['hidden_units_dim']))
+        i = tensor.nnet.sigmoid(self.__slice(preact, 0, self.struct_params['hidden_units_dim']))
+        f = tensor.nnet.sigmoid(self.__slice(preact, 1, self.struct_params['hidden_units_dim']))
+        o = tensor.nnet.sigmoid(self.__slice(preact, 2, self.struct_params['hidden_units_dim']))
+        c = tensor.tanh(self.__slice(preact, 3, self.struct_params['hidden_units_dim']))
+
+        c = f * c_ + i * c
+        c = m_[:, None] * c + (1. - m_)[:, None] * c_
+
+        h = o * tensor.tanh(c)
+        h = m_[:, None] * h + (1. - m_)[:, None] * h_
+
+        return h, c
+    
+    
+    def decoder_lstm_unit(self, x_, m_, a_, h_, c_, n_layer):
+        preact = (tensor.dot(h_, self.nn_weights['dec_U'][n_layer]) +
+                  tensor.dot(a_, self.nn_weights['dec_V'][n_layer]))
+        preact += x_
+
+        i = tensor.nnet.sigmoid(self.__slice(preact, 0, self.struct_params['hidden_units_dim']))
+        f = tensor.nnet.sigmoid(self.__slice(preact, 1, self.struct_params['hidden_units_dim']))
+        o = tensor.nnet.sigmoid(self.__slice(preact, 2, self.struct_params['hidden_units_dim']))
+        c = tensor.tanh(self.__slice(preact, 3, self.struct_params['hidden_units_dim']))
 
         c = f * c_ + i * c
         c = m_[:, None] * c + (1. - m_)[:, None] * c_
@@ -89,114 +106,110 @@ class SAE:
         return h, c
 
 
-    def get_encoder_last_layer(self, x_seq, mask, iter_direction):
-        nsteps = x_seq.shape[0]
-        if x_seq.ndim == 3:
-            n_samples = x_seq.shape[1]
+    def get_encoder_layer(self, input_seq, mask, below_layer, n_layer):
+        nsteps = input_seq.shape[0]
+        if input_seq.ndim == 3:
+            n_samples = input_seq.shape[1]
         else:
             n_samples = 1
 
-        layer_num = self.struct_params['encoder_n_layers']
         init_val = [tensor.alloc(self.__numpy_floatX(0.), n_samples, self.struct_params['hidden_units_dim']),
                     tensor.alloc(self.__numpy_floatX(0.), n_samples, self.struct_params['hidden_units_dim'])]
 
-        y = (tensor.dot(x_seq, self.nn_weights['enc_W'][layer_num]) +
-             self.nn_weights['enc_b'][layer_num])
-        rval, update = theano.scan(name          = '',
-                                   fn            = self.__lstm_unit,
-                                   sequences     = [x_seq, mask],
-                                   outputs_info  = init_val,
-                                   non_sequences = 'enc_U', # we only compute U*x in LSTM
-                                   n_steps       = nsteps)
-        return rval[-1]
+        state = (tensor.dot(input_seq, self.nn_weights['enc_W'][n_layer]) +
+                 tensor.dot(below_layer, self.nn_weights['enc_V'][n_layer]) +
+                 self.nn_weights['enc_b'][n_layer])
+
+        layer_output, update = theano.scan(name          = '',
+                                           fn            = self.encoder_lstm_unit,
+                                           sequences     = [state, mask],
+                                           outputs_info  = init_val,
+                                           non_sequences = n_layer,
+                                           n_steps       = nsteps)
+        return layer_output
 
 
-    def get_decoder_first_layer(self, y_seq, mask, c):
-
-        nsteps = y_seq.shape[0]
-        if y_seq.ndim == 3:
-            n_samples = y_seq.shape[1]
+    def get_decoder_layer(self, input_seq, mask, below_layer, context_vector, n_layer):
+        nsteps = input_seq.shape[0]
+        if input_seq.ndim == 3:
+            n_samples = input_seq.shape[1]
         else:
             n_samples = 1
 
-        layer_num = self.struct_params['decoder_n_layers']
-        assert layer_num == 1 #todo
+        init_val = [tensor.alloc(self.__numpy_floatX(0.), n_samples, self.struct_params['hidden_units_dim']),
+                    tensor.alloc(self.__numpy_floatX(0.), n_samples, self.struct_params['hidden_units_dim'])]
 
-        h_0 = tensor.tanh(tensor.dot(self.nn_weights['V'], c))
+        state = (tensor.dot(input_seq, self.nn_weights['dec_W'][n_layer]) +
+                 tensor.dot(context_vector, self.nn_weights['dec_C'][n_layer]) +
+                 self.nn_weights['enc_b'][n_layer])
 
-        y = (tensor.dot(y_seq, self.nn_weights['dec_W'][layer_num]) +
-             tensor.dot(c, self.nn_weights['dec_C'][layer_num]) +
-             self.nn_weights['dec_b'][layer_num])
-        rval, update = theano.scan(name          = '',
-                                   fn            = self.__lstm_unit,
-                                   sequences     = [y_seq, mask],
-                                   outputs_info  = h_0,
-                                   non_sequences = 'dec_U',
-                                   n_steps       = nsteps)
-
-
-
-    def get_decoder_layer(self, h_seq, mask):
-
-        nsteps = h_seq.shape[0]
-        if h_seq.ndim == 3:
-            n_samples = h_seq.shape[1]
-        else:
-            n_samples = 1
-
-        layer_num = self.struct_params['decoder_n_layers']
-        assert layer_num == 1 #todo
-
-        h_0 = tensor.tanh(tensor.dot(self.nn_weights['V'])) # todo
-
-        y = (tensor.dot(h_seq, self.nn_weights['dec_W'][layer_num]) +
-             self.nn_weights['dec_b'][layer_num])
-        rval, update = theano.scan(name          = '',
-                                   fn            = self.__lstm_unit,
-                                   sequences     = [h_seq, mask],
-                                   outputs_info  = h_0,
-                                   non_sequences = 'dec_U',
-                                   n_steps       = nsteps)
+        layer_output, update = theano.scan(name          = '',
+                                           fn            = self.decoder_lstm_unit,
+                                           sequences     = [state, mask, below_layer],
+                                           outputs_info  = init_val,
+                                           non_sequences = n_layer,
+                                           n_steps       = nsteps)
+        return layer_output
 
 
-    # TODO: Before concatenate all layers, the MLP layer must be used.
-    # TODO: Remember: different Xcoder forms.
+    def get_encoder(self, x, x_mask):
+        """
+        Encoder:
+        We build a four layers encoder without dropout, dropout layers will be planted
+        """
+        encoder_layers = self.struct_params['encoder_layers']
+
+        h1 = self.get_encoder_layer(x, x_mask, x, 0)
+        h2 = self.get_encoder_layer(x, x_mask, h1, 1)
+        h3 = self.get_encoder_layer(x, x_mask, h2, 2)
+        h4 = self.get_encoder_layer(x, x_mask, h3, 3)
+
+        return h4[-1]
+
+
+    def get_decoder(self, y, y_mask, context_vector):
+        """
+        decoder:
+        We build a four layers decoder without dropout, dropout layers will be planted
+        """
+        decoder_layers = self.struct_params['decoder_layers']
+
+        h1 = self.get_decoder_layer(y, y_mask, y, context_vector, 0) # TODO:
+        h2 = self.get_decoder_layer(y, y_mask, h1, context_vector, 1)
+        h3 = self.get_decoder_layer(y, y_mask, h2, context_vector, 2)
+        h4 = self.get_decoder_layer(y, y_mask, h3, context_vector, 3)
+
+        return h4
+
+
     def build_sae_model(self):
-        # TODO：prehandle data
-        encoder_n_layers = self.struct_params['']
-        decoder_n_layers = self.struct_params['']
-
-        #TODO Build sentence encoder, using get_encoder_layer()
-
-        #TODO Build sentence decoder, using get_decoder_layer()
-
-
-    def sgd(self):
         """
-        ------Stochastic Gradient Descent------
+
         """
-        pass
+        # TODO: prehandle data
+        x = []
+
+        # ------ Encoder ------
+        forward_encoder, backward_encoder = self.get_encoder
+
+        h_fwec = forward_encoder() #TODO:
+        h_bwec = backward_encoder() #TODO: input need to be reversed
+
+        h_enc = tensor.concatenate([h_fwec, h_bwec], axis=1)
+
+        # ------ Feature Extraction ------
+        # We use MLP (Multi Layer Perceptron) to get high-level representation.
+        # The MLP is 2 layers
+        # In the future, the CNN (Convolutional Neural Network) may be added in
+        h1_mlp = tensor.nnet.relu(tensor.dot(h_enc, self.nn_weights['mlp_W'][0] + self.nn_weights['mlp_b'][0]), alpha=0)
+        h2_mlp = tensor.nnet.relu(tensor.dot(h1_mlp, self.nn_weights['mlp_W'][1] + self.nn_weights['mlp_b'][1]), alpha=0)
+
+        # ------ Decoder ------
+        decoder = self.get_decoder
+
+        h_dec = decoder() # TODO:
+
+        # ------ 2-Maxout Layer ------
 
 
-    def save_model(self):
-        pass
-
-
-    def load_model(self):
-        pass
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        # ------ Softmax Layer ------
