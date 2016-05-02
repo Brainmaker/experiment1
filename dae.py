@@ -208,7 +208,7 @@ class LSTMDecoder:
 
     def decode(self, y_tm1, h_tm1, c_tm1, mask, context_vector):
         """
-        特点概述：对每个mask的句子走一步看一步，直到输出终止符
+
         """
         h, c = self._decode_step(y_tm1, h_tm1, c_tm1, mask, context_vector)
         return h, c
