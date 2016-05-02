@@ -45,8 +45,12 @@ def get_ortho_weight(dim):
     tmp = numpy.random.randn(dim, dim)
     u, s, v = numpy.linalg.svd(tmp)
     u = u.astype(config.floatX)
-    concat_ortho_weight = numpy.concatenate([u, u, u, u], axis=1)
-    return concat_ortho_weight
+    w = numpy.concatenate([u, u, u, u], axis=1)
+    return w
+
+def init_mlp_weights(dim1, dim2):
+    w = numpy.random.randn(dim1, dim2)
+    return w.astype(dtype)
 
 
 def tensor_slice(_x, slice_tag, dim):
@@ -96,9 +100,13 @@ class LSTMEncoder:
         self.dim = dim
         self.nn_weights = {}.fromkeys(['W', 'U', 'b'])
 
-        self.nn_weights['W'] = get_ortho_weight(dim)
-        self.nn_weights['U'] = get_ortho_weight(dim)
-        self.nn_weights['b'] = numpy.zeros((4 * dim,))
+        W = get_ortho_weight(dim).astype(dtype)
+        U = get_ortho_weight(dim).astype(dtype)
+        b = numpy.zeros((4 * dim,)).astype(dtype)
+
+        self.nn_weights['W'] = theano.shared(W, 'enc_W')
+        self.nn_weights['U'] = theano.shared(U, 'enc_U')
+        self.nn_weights['b'] = theano.shared(b, 'enc_b')
 
 
     def encode_step(self, x, m_, h_tm1, c_tm1):
@@ -137,6 +145,8 @@ class LSTMEncoder:
 
         state = (tensor.dot(x, self.nn_weights['W']) +
                  self.nn_weights['b'])
+        if state.ndim == 3:
+            print('aaaa')
 
         layer_output, update = theano.scan(name          = 'LSTMEncoder',
                                            fn            = self.encode_step,
@@ -144,7 +154,7 @@ class LSTMEncoder:
                                            outputs_info  = init_val,
                                            non_sequences = None,
                                            n_steps       = nsteps)
-        return layer_output
+        return layer_output[0]
 
 
 class LSTMDecoder:
@@ -155,22 +165,32 @@ class LSTMDecoder:
         self.dim = dim
         self.nn_weights = {}.fromkeys(['W', 'U', 'C', 'b'])
 
-        self.nn_weights['W'] = get_ortho_weight(dim)
-        self.nn_weights['U'] = get_ortho_weight(dim)
-        self.nn_weights['C'] = get_ortho_weight(dim)
-        self.nn_weights['b'] = numpy.zeros((4 * dim,))
+        W = get_ortho_weight(dim).astype(dtype)
+        U = get_ortho_weight(dim).astype(dtype)
+        C = get_ortho_weight(dim).astype(dtype)
+        b = numpy.zeros((4 * dim,)).astype(dtype)
+
+        self.nn_weights['W'] = theano.shared(W, 'enc_W')
+        self.nn_weights['U'] = theano.shared(U, 'enc_U')
+        self.nn_weights['C'] = theano.shared(C, 'enc_C')
+        self.nn_weights['b'] = theano.shared(b, 'enc_b')
 
 
-    def _decode_step(self, y_tm1, m_, h_tm1, c_tm1, state):
+    def _decode_step(self, y_tm1, h_tm1, c_tm1, m_, context_vector):
         """
         Basic Equation:
 
             h(t), c(t) = Dec( LSTM(y(t), h(t-1), c(t-1)) )
 
         """
+        if m_.ndim == 3:
+            print('cc')
+
         preact = (tensor.dot(y_tm1, self.nn_weights['W']) +
-                  tensor.dot(h_tm1, self.nn_weights['U']))
-        preact += state
+                  tensor.dot(h_tm1, self.nn_weights['U']) +
+                  tensor.dot(context_vector, self.nn_weights['C']) +
+                  self.nn_weights['b'])
+        # preact += state
 
         i = tensor.nnet.sigmoid(tensor_slice(preact, 0, self.dim))
         f = tensor.nnet.sigmoid(tensor_slice(preact, 1, self.dim))
@@ -201,21 +221,44 @@ class MLP:
         self.output_dim = params['output_dim']
         self.mlp_n_layers = params['mlp_n_layers']
 
-        self.nn_weights = {}.fromkeys(['w1','w2','w3','b1','b2','b3'])
-        self.nn_weights['w1'] = self._init_mlp_weights(self.input_dim, self.hidden_dim)
+        self.nn_weights = {}.fromkeys(['W1','W2','W3','b1','b2','b3'])
+
+        W1 = init_mlp_weights(self.input_dim, self.hidden_dim)
+        W2 = init_mlp_weights(self.hidden_dim, self.hidden_dim)
+        W3 = init_mlp_weights(self.hidden_dim, self.output_dim)
+        b1 = numpy.zeros((self.hidden_dim,)).astype(dtype)
+        b2 = numpy.zeros((self.hidden_dim,)).astype(dtype)
+        b3 = numpy.zeros((self.output_dim,)).astype(dtype)
+
+        self.nn_weights['W1'] = theano.shared(W1, 'W1')
+        self.nn_weights['W2'] = theano.shared(W2, 'W2')
+        self.nn_weights['W3'] = theano.shared(W3, 'W3')
+        self.nn_weights['b1'] = theano.shared(b1, 'b1')
+        self.nn_weights['b2'] = theano.shared(b2, 'b2')
+        self.nn_weights['b3'] = theano.shared(b3, 'b3')
 
 
-    def _init_mlp_weights(self, dim1, dim2):
-        bound = numpy.sqrt(1.0/dim1)
-        w = numpy.random.uniform(-bound, bound, dim1)
-        return w
-
-
-    def run_mlp(self, x):
-        h1 = tensor.nnet.relu(tensor.dot(self.nn_weights['w1'], x) + self.nn_weights['b1'])
-        h2 = tensor.nnet.relu(tensor.dot(self.nn_weights['w2'], h1) + self.nn_weights['b2'])
-        h3 = tensor.nnet.relu(tensor.dot(self.nn_weights['w3'], h2) + self.nn_weights['b3'])
+    def encode(self, x):
+        h1 = tensor.nnet.relu(tensor.dot(x, self.nn_weights['W1']) + self.nn_weights['b1'])
+        h2 = tensor.nnet.relu(tensor.dot(h1, self.nn_weights['W2']) + self.nn_weights['b2'])
+        h3 = tensor.nnet.relu(tensor.dot(h2, self.nn_weights['W3']) + self.nn_weights['b3'])
         return h3
+
+
+class MultiLayerEncoder:
+    def __init__(self, dim):
+        self.enc_layer_1 = LSTMEncoder(dim)
+        self.enc_layer_2 = LSTMEncoder(dim)
+        self.enc_layer_3 = LSTMEncoder(dim)
+        self.enc_layer_4 = LSTMEncoder(dim)
+
+
+    def encode(self, emb_x, x_mask):
+        enc_h1 = self.enc_layer_1.encode(emb_x, x_mask)
+        enc_h2 = self.enc_layer_2.encode(enc_h1, x_mask)
+        enc_h3 = self.enc_layer_3.encode(enc_h2, x_mask)
+        enc_h4 = self.enc_layer_4.encode(enc_h3, x_mask)
+        return enc_h4
 
 
 class Seq2Seq:
@@ -227,10 +270,8 @@ class Seq2Seq:
 
         self.emb_matrix = tensor.matrix('emb_matrix')
 
-        self.enc_layer_1 = LSTMEncoder(self.enc_dim)
-        self.enc_layer_2 = LSTMEncoder(self.enc_dim)
-        self.enc_layer_3 = LSTMEncoder(self.enc_dim)
-        self.enc_layer_4 = LSTMEncoder(self.enc_dim)
+        self.fencoder = MultiLayerEncoder(self.enc_dim)
+        self.bencoder = MultiLayerEncoder(self.enc_dim)
 
         self.mlp = MLP(params)
 
@@ -244,41 +285,49 @@ class Seq2Seq:
                      c1_tm1, c2_tm1, c3_tm1, c4_tm1,
                      h1_tm1, h2_tm1, h3_tm1, h4_tm1,
                      context_vector):
-        mask = 0
+        mask = 0 # TODO:
         h1, c1 = self.dec_layer_1.decode(y_tm1, h1_tm1, c1_tm1, mask, context_vector)
-        h2, c2 = self.dec_layer_1.decode(y_tm1, h2_tm1, c2_tm1, mask, context_vector)
-        h3, c3 = self.dec_layer_1.decode(y_tm1, h3_tm1, c3_tm1, mask, context_vector)
-        h4, c4 = self.dec_layer_1.decode(y_tm1, h4_tm1, c4_tm1, mask, context_vector)
+        h2, c2 = self.dec_layer_2.decode(h1, h2_tm1, c2_tm1, mask, context_vector)
+        h3, c3 = self.dec_layer_3.decode(h2, h3_tm1, c3_tm1, mask, context_vector)
+        h4, c4 = self.dec_layer_4.decode(h3, h4_tm1, c4_tm1, mask, context_vector)
 
-        y = h1 # convert to y
+        y = h4 # TODO: convert to y
         return y, c1, c2, c3, c4, h1, h2, h3, h4
 
 
-    def build_model(self):
-        x = tensor.matrix('x', dtype='')
-        x_mask = tensor.matrix('x_mask', dtype='')
-        y = tensor.matrix('y', dtype='')
-        y_mask = tensor.matrix('y_mask', dtype='')
+    def build_model(self, x, x_mask, rx, rx_mask, max_length):
+        if x.ndim == 3:
+            n_samples = x.shape[1]
+        else:
+            n_samples = 1
 
-        emb_x = tensor.dot(x, self.emb_matrix)
+        #emb_x = tensor.dot(x, self.emb_matrix)
+        #emb_rx = tensor.dot(rx, self.emb_matrix)
+        emb_x = x
+        emb_rx = rx
 
-        enc_h1 = self.enc_layer_1.encode(x, x_mask)
-        enc_h2 = self.enc_layer_2.encode(enc_h1, x_mask)
-        enc_h3 = self.enc_layer_3.encode(enc_h2, x_mask)
-        enc_h4 = self.enc_layer_4.encode(enc_h3, x_mask)
+        fenc_h = self.fencoder.encode(emb_x, x_mask)
+        benc_h = self.fencoder.encode(emb_rx, rx_mask)
 
-        enc_h = tensor.concatenate(enc_h4, axis=1)
+        enc_h = tensor.concatenate([fenc_h, benc_h], axis=1)
+        context_vector = self.mlp.encode(enc_h)
 
-        context_vector = 0
-        init_val = 0
-        max_length = 100
+        init_val =[tensor.alloc(numpy_floatX(0.), n_samples, self.dec_dim),
+                   tensor.alloc(numpy_floatX(0.), n_samples, self.dec_dim),
+                   tensor.alloc(numpy_floatX(0.), n_samples, self.dec_dim),
+                   tensor.alloc(numpy_floatX(0.), n_samples, self.dec_dim),
+                   tensor.alloc(numpy_floatX(0.), n_samples, self.dec_dim),
+                   tensor.alloc(numpy_floatX(0.), n_samples, self.dec_dim),
+                   tensor.alloc(numpy_floatX(0.), n_samples, self.dec_dim),
+                   tensor.alloc(numpy_floatX(0.), n_samples, self.dec_dim),
+                   tensor.alloc(numpy_floatX(0.), n_samples, self.dec_dim),]
 
-        y = theano.scan(name          = 'seq2seq',
-                        fn            = self.decoder_step(),
-                        outputs_info  = init_val,
-                        non_sequences = context_vector,
-                        n_steps       = max_length)
-
+        pred_seq = theano.scan(name          = 'seq2seq',
+                               fn            = self.decoder_step,
+                               outputs_info  = init_val,
+                               non_sequences = context_vector,
+                               n_steps       = max_length)
+        return pred_seq[0]
 
 
 
