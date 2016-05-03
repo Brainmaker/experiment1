@@ -46,13 +46,13 @@ def get_random_weights(dim1, dim2):
     return w.astype(dtype)
 
 
-def tensor_slice(_x, slice_tag, dim):
+def tensor_slice(x, slice_tag, dim):
     """
     使用注意！例如W的大小是(N * 4N)，则dim=N
     """
-    if _x.ndim == 3:
-        return _x[:, :, slice_tag*dim : (slice_tag+1)*dim]
-    return _x[:, slice_tag*dim : (slice_tag+1)*dim]
+    if x.ndim == 3:
+        return x[:, :, slice_tag*dim : (slice_tag+1)*dim]
+    return x[:, slice_tag*dim : (slice_tag+1)*dim]
 
 
 def adadelta(params, cost, lr=1.0, rho=0.95):
@@ -99,7 +99,7 @@ class Encoder:
             self.nn_weights['b'] = np2shared(numpy.zeros((4 * dim,)).astype(dtype), 'b')
 
 
-        def encode_step(self, x, m_, h_tm1, c_tm1):
+        def encode_step(self, x, mask, h_tm1, c_tm1):
             """
             Basic Equation:
                 h(t), c(t) = LSTM(x(t), h(t-1), c(t-1))
@@ -113,10 +113,10 @@ class Encoder:
             c = tensor.tanh(tensor_slice(preact, 3, self.dim))
 
             c = f * c_tm1 + i * c
-            c = m_[:, None] * c + (1. - m_)[:, None] * c_tm1
+            c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
 
             h = o * tensor.tanh(c)
-            h = m_[:, None] * h + (1. - m_)[:, None] * h_tm1
+            h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
 
             return h, c
 
@@ -163,14 +163,11 @@ class Encoder:
             return h3
 
 
-    def __init__(self):
-        dim1, dim2, dim3 = 0, 0, 0
-        self.enc_dim = 0
-        self.mlp_dim1 = 1
-        self.mlp_dim2 = 2
-        self.mlp_dim3 = 3
-        self.lstm_enc_n_layers = 4
-        self.lstm_enc_n_layers = 4
+    def __init__(self, enc_dim, mlp_dim1, mlp_dim2, mlp_dim3):
+        self.enc_dim = enc_dim
+        self.mlp_dim1 = mlp_dim1
+        self.mlp_dim2 = mlp_dim2
+        self.mlp_dim3 = mlp_dim3
 
         assert 2 * self.enc_dim == self.mlp_dim1
         
@@ -222,12 +219,13 @@ class Decoder:
             self.nn_weights['b'] = np2shared(numpy.zeros((4 * dim,)).astype(dtype), 'b')
 
 
-        def layer_decode_step(self, y_tm1, m_, h_tm1, c_tm1, context_vector):
+        def layer_decode_step(self, y_tm1, mask, h_tm1, c_tm1, context_vector):
             preact = (tensor.dot(y_tm1, self.nn_weights['W']) +
                       tensor.dot(h_tm1, self.nn_weights['U']) +
                       tensor.dot(context_vector, self.nn_weights['C']) +
                       self.nn_weights['b'])
             # preact += state
+            print(mask)
 
             i = tensor.nnet.sigmoid(tensor_slice(preact, 0, self.dim))
             f = tensor.nnet.sigmoid(tensor_slice(preact, 1, self.dim))
@@ -235,19 +233,18 @@ class Decoder:
             c = tensor.tanh(tensor_slice(preact, 3, self.dim))
 
             c = f * c_tm1 + i * c
-            c = m_[:, None] * c + (1. - m_)[:, None] * c_tm1
+            #c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
 
             h = o * tensor.tanh(c)
-            h = m_[:, None] * h + (1. - m_)[:, None] * h_tm1
+            #h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
 
             return h, c
 
-    def __init__(self, max_output_seq_len=100):
-        dec_dim = 0
-        lstm_dec_n_layers = 4
-        self.dec_dim = 3
+
+    def __init__(self, dec_dim, dec_steps=100):
+        self.dec_dim = dec_dim
         self.lstm_dec_n_layers = 4
-        self.max_output_seq_len = max_output_seq_len
+        self.dec_steps = dec_steps
 
         self.dec_layer_1 = Decoder.LSTMDecoderLayer(self.dec_dim)
         self.dec_layer_2 = Decoder.LSTMDecoderLayer(self.dec_dim)
@@ -280,20 +277,35 @@ class Decoder:
 
 
     def decode(self, context_vector):
-        batch_size = context_vector.shape[1]
+        batch_size = context_vector.shape[0]
         init_state = self._get_init_state(batch_size)
-        pred_seq = theano.scan(name          = 'seq2seq',
-                               fn            = self.decode_step,
-                               outputs_info  = init_state,
-                               non_sequences = context_vector,
-                               n_steps       = self.max_output_seq_len)
-        return pred_seq
+        rval, updates = theano.scan(name          = 'seq2seq',
+                                    fn            = self.decode_step,
+                                    outputs_info  = init_state, #
+                                    non_sequences = context_vector, # 4*3
+                                    n_steps       = self.dec_steps)
+        prob_pred_seq = rval[0]
+        return prob_pred_seq
 
 
 class Seq2Seq:
     def __init__(self, params):
-        self.encoder = Encoder()
-        self.decoder = Decoder()
+        self.encoder = Encoder(enc_dim  = params['enc_dim'],
+                               mlp_dim1 = params['mlp_dim1'],
+                               mlp_dim2 = params['mlp_dim2'],
+                               mlp_dim3 = params['mlp_dim3'])
+
+        self.decoder = Decoder(dec_dim   = params['dec_dim'],
+                               dec_steps = params['dec_steps'])
+
+
+    def build_model(self, x, x_mask):
+        context_vectors = self.encoder.encode(x, x_mask)
+        prob_pred_seq = self.decoder.decode(context_vectors)
+        pred_seq = prob_pred_seq #TODO
+        return prob_pred_seq, pred_seq
+
+
 
 
 
