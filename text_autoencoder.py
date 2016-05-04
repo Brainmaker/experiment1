@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-  ------ text Autoencoder ------
+  ------ Text Autoencoder ------
   Created by Xiaolin Wan, 5.4.2016
-
   Draft* Do NOT cite.
 """
 
@@ -164,21 +163,23 @@ class Encoder:
             return h3
 
 
-    def __init__(self, enc_dim, enc_nlayers, mlp_dim1, mlp_dim2, mlp_dim3):
+    def __init__(self, enc_dim, mlp_dim1, mlp_dim2, mlp_dim3):
         self.enc_dim = enc_dim
-        self.enc_nlayers = enc_nlayers
         self.mlp_dim1 = mlp_dim1
         self.mlp_dim2 = mlp_dim2
         self.mlp_dim3 = mlp_dim3
 
         assert 2 * self.enc_dim == self.mlp_dim1
-
+        
+        self.fenc_1 = Encoder.LSTMEncoderLayer(self.enc_dim)
+        self.fenc_2 = Encoder.LSTMEncoderLayer(self.enc_dim)
+        self.fenc_3 = Encoder.LSTMEncoderLayer(self.enc_dim)
+        self.fenc_4 = Encoder.LSTMEncoderLayer(self.enc_dim)
+        self.benc_1 = Encoder.LSTMEncoderLayer(self.enc_dim)
+        self.benc_2 = Encoder.LSTMEncoderLayer(self.enc_dim)
+        self.benc_3 = Encoder.LSTMEncoderLayer(self.enc_dim)
+        self.benc_4 = Encoder.LSTMEncoderLayer(self.enc_dim)
         self.mlp_enc = Encoder.MLP(self.mlp_dim1, self.mlp_dim2, self.mlp_dim3)
-
-        self.fenc_container, self.benc_container = [], []
-        for i in range(0, self.enc_nlayers):
-            self.fenc_container.append(Encoder.LSTMEncoderLayer(self.enc_dim))
-            self.benc_container.append(Encoder.LSTMEncoderLayer(self.enc_dim))
 
 
     def encode(self, x, x_mask):
@@ -187,17 +188,21 @@ class Encoder:
         emb_rx = x
         rx_mask = x_mask
 
-        f_h = emb_x, b_h = emb_rx
-        assert self.fenc_container.__len__() == self.benc_container.__len__()
-        for fenc_layer, benc_layer in self.fenc_container, self.benc_container:
-            f_h = fenc_layer.encode_step(f_h, x_mask)
-            b_h = benc_layer.encode_step(b_h, rx_mask)
+        fenc_h1 = self.fenc_1.layer_encode(emb_x, x_mask)
+        fenc_h2 = self.fenc_2.layer_encode(fenc_h1, x_mask)
+        fenc_h3 = self.fenc_3.layer_encode(fenc_h2, x_mask)
+        fenc_h4 = self.fenc_4.layer_encode(fenc_h3, x_mask)
 
-        enc_h = tensor.concatenate([f_h[0], b_h[0]], axis=1)
+        benc_h1 = self.fenc_1.layer_encode(emb_rx, rx_mask)
+        benc_h2 = self.fenc_2.layer_encode(benc_h1, rx_mask)
+        benc_h3 = self.fenc_3.layer_encode(benc_h2, rx_mask)
+        benc_h4 = self.fenc_4.layer_encode(benc_h3, rx_mask)
+
+        enc_h = tensor.concatenate([fenc_h4[0], benc_h4[0]], axis=1)
 
         context_vector = self.mlp_enc.mlp_encode(enc_h)
 
-        return context_vector
+        return fenc_h4[0]
 
 
 class Decoder:
@@ -236,36 +241,39 @@ class Decoder:
             return h, c
 
 
-    def __init__(self, dec_dim, dec_nlayers, dec_steps=100):
+    def __init__(self, dec_dim, dec_steps=100):
         self.dec_dim = dec_dim
-        self.dec_nlayers = dec_nlayers
+        self.lstm_dec_n_layers = 4
         self.dec_steps = dec_steps
-        
-        self.dec_container = []
-        for i in range(0, self.dec_nlayers):
-            self.dec_container.append(Decoder.LSTMDecoderLayer(self.dec_dim))
+
+        self.dec_layer_1 = Decoder.LSTMDecoderLayer(self.dec_dim)
+        self.dec_layer_2 = Decoder.LSTMDecoderLayer(self.dec_dim)
+        self.dec_layer_3 = Decoder.LSTMDecoderLayer(self.dec_dim)
+        self.dec_layer_4 = Decoder.LSTMDecoderLayer(self.dec_dim)
 
 
     def _get_init_state(self, batch_size):
-        y0 = tensor.alloc(data2npfloatX(0.), batch_size, self.dec_dim)
-        h0, c0 = [], []
-        for i in range(0, self.dec_nlayers):
-            h0.append(tensor.alloc(data2npfloatX(0.), batch_size, self.dec_dim))
-            c0.append(tensor.alloc(data2npfloatX(0.), batch_size, self.dec_dim))
-        init_state = [y0, h0, c0]
+        init_state = []
+        for i in range(0, 9):
+            init_state.append(tensor.alloc(data2npfloatX(0.), batch_size, self.dec_dim))
 
         return init_state
 
 
-    def decode_step(self, y_tm1, h, c, context_vector):
+    def decode_step(self, y_tm1,
+                    c1_tm1, c2_tm1, c3_tm1, c4_tm1,
+                    h1_tm1, h2_tm1, h3_tm1, h4_tm1,
+                    context_vector):
         mask = 0
-        h[0], c[0] = self.dec_container[0].layer_decode_step(y_tm1, mask, h[0], c[0], context_vector)
-        for i in range(1, self.dec_nlayers):
-            h[i], c[i] = self.dec_container[i].layer_decode_step(h[i-1], mask, h[i], c[i], context_vector)
+        h1, c1 = self.dec_layer_1.layer_decode_step(y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+        h2, c2 = self.dec_layer_1.layer_decode_step(h1, mask, h2_tm1, c2_tm1, context_vector)
+        h3, c3 = self.dec_layer_1.layer_decode_step(h2, mask, h3_tm1, c3_tm1, context_vector)
+        h4, c4 = self.dec_layer_1.layer_decode_step(h3, mask, h4_tm1, c4_tm1, context_vector)
 
-        y = h[self.dec_nlayers-1] #TODO: convert to y
-        return y
-
+        y = h4 #TODO: convert to y
+        return (y,
+                c1, c2, c3, c4,
+                h1, h2, h3, h4)
 
 
     def decode(self, context_vector):
@@ -276,8 +284,8 @@ class Decoder:
                                     outputs_info  = init_state, #
                                     non_sequences = context_vector, # 4*3
                                     n_steps       = self.dec_steps)
-        prob_pred_seq = rval[0]
-        return prob_pred_seq
+        pred_h = rval[0]
+        return pred_h
 
 
 class Seq2Seq:
@@ -302,7 +310,15 @@ class Seq2Seq:
         #return prob_pred_seq, pred_seq
 
 
-class SAE(Seq2Seq):
+    def save_model(self):
+        pass
+
+
+    def load_model(self):
+        pass
+
+
+class SAE(Seq2Seq): #TODO
     def __init__(self, params):
         Seq2Seq.__init__(self, params)
 
@@ -311,7 +327,7 @@ class SAE(Seq2Seq):
         pass
 
 
-class DAE(Seq2Seq):
+class DAE(Seq2Seq): #TODO
     def __init__(self, params):
         Seq2Seq.__init__(self, params)
 
