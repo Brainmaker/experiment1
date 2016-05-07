@@ -3,19 +3,26 @@
 """
   ------ Text Autoencoder ------
   Created by Xiaolin Wan, 5.4.2016
+
+  Build a deeply document autoencoder with Bi-LSTM.
+  We adopt a Bi-LSTM structure with four layer for encoding and four layer for decoding,
+  a deeply structure is planted between encoder and decoder to extract high-level sentence representation.
+
   Draft* Do NOT cite.
 """
 
 import sys
 import time
+import json
 
 import numpy
 import theano
 import theano.tensor as tensor
 from theano import config
-from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
+from theano.sandbox.rng_mrg import MRG_RandomStreams
 
 epsilon = 1e-6
+trng = MRG_RandomStreams(seed=888)
 dtype = theano.config.floatX
 
 def np2shared(value, name=None):
@@ -49,6 +56,13 @@ def tensor_slice(x, slice_tag, dim):
     if x.ndim == 3:
         return x[:, :, slice_tag*dim : (slice_tag+1)*dim]
     return x[:, slice_tag*dim : (slice_tag+1)*dim]
+
+
+def dropout_layer(state_before, use_noise, trng_=trng):
+    proj = tensor.switch(cond = use_noise,
+                         ift  = (state_before * trng_.binomial(state_before.shape,p=0.5, n=1,dtype=state_before.dtype)), # ift
+                         iff  = state_before * 0.5)
+    return proj
 
 
 def adadelta(params, cost, lr=1.0, rho=0.95):
@@ -86,170 +100,204 @@ def mean_square_error(y_true, y_pred):
     return tensor.mean(tensor.square(y_pred - y_true))
 
 
+class Core:
+    def __init__(self):
+        self.nn_weights = {}
+
+    def nn_weights2json(self):
+        nn_weights = {}.fromkeys(self.nn_weights.keys())
+        for kk in nn_weights:
+            nn_weights[kk] = self.nn_weights[kk].tolist()
+        return json.dumps(nn_weights)
+
+
+    def json2nn_weights(self, jsonstr):
+        nn_weights = json.loads(jsonstr)
+        assert nn_weights.keys() == self.nn_weights.keys()
+        for kk in nn_weights:
+            self.nn_weights[kk] = np2shared(numpy.array(nn_weights[kk], dtype=dtype))
+
+
+class MLP(Core):
+    def __init__(self, dim1, dim2, dim3):
+        Core.__init__(self)
+        self.dim1, self.dim2, self.dim3 = dim1, dim2, dim3
+        self.nn_weights = {}.fromkeys(['W1', 'W2', 'W3', 'b1', 'b2', 'b3'])
+
+        self.nn_weights['W1'] = np2shared(get_random_weights(dim1, dim2), 'W1')
+        self.nn_weights['W2'] = np2shared(get_random_weights(dim2, dim2), 'W2')
+        self.nn_weights['W3'] = np2shared(get_random_weights(dim2, dim3), 'W3')
+        self.nn_weights['b1'] = np2shared(numpy.zeros((dim2,)).astype(dtype), 'b1')
+        self.nn_weights['b2'] = np2shared(numpy.zeros((dim2,)).astype(dtype), 'b2')
+        self.nn_weights['b3'] = np2shared(numpy.zeros((dim3,)).astype(dtype), 'b3')
+
+    def mlp_encode(self, x):
+        h1 = tensor.nnet.relu(tensor.dot(x, self.nn_weights['W1']) + self.nn_weights['b1'])
+        h2 = tensor.nnet.relu(tensor.dot(h1, self.nn_weights['W2']) + self.nn_weights['b2'])
+        h3 = tensor.nnet.relu(tensor.dot(h2, self.nn_weights['W3']) + self.nn_weights['b3'])
+        return h3
+
+
+    def weights2json(self):
+        return nn_weights2json(self.nn_weights)
+
+
+    def json2weights(self, jsonstr):
+        self.nn_weights = json2nn_weights(jsonstr)
+
+
+class LSTMEncoderLayer(Core):
+    def __init__(self, dim):
+        Core.__init__(self)
+        # W, U is (n * 4n), b is (1 * 4n)
+        self.dim = dim
+        self.nn_weights = {}.fromkeys(['W', 'U', 'b'])
+
+        self.nn_weights['W'] = np2shared(get_4_ortho_weight(dim), 'W')
+        self.nn_weights['U'] = np2shared(get_4_ortho_weight(dim), 'U')
+        self.nn_weights['b'] = np2shared(numpy.zeros((4 * dim,)).astype(dtype), 'b')
+
+    def encode_step(self, x, mask, h_tm1, c_tm1):
+        """
+        Basic Equation:
+            h(t), c(t) = LSTM(x(t), h(t-1), c(t-1))
+        """
+        preact = tensor.dot(h_tm1, self.nn_weights['U'])
+        preact += x
+
+        i = tensor.nnet.sigmoid(tensor_slice(preact, 0, self.dim))
+        f = tensor.nnet.sigmoid(tensor_slice(preact, 1, self.dim))
+        o = tensor.nnet.sigmoid(tensor_slice(preact, 2, self.dim))
+        c = tensor.tanh(tensor_slice(preact, 3, self.dim))
+
+        c = f * c_tm1 + i * c
+        c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
+
+        h = o * tensor.tanh(c)
+        h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
+
+        return h, c
+
+    def layer_encode(self, x, x_mask):
+        nsteps = x.shape[0]
+        if x.ndim == 3:
+            n_samples = x.shape[1]
+        else:
+            n_samples = 1
+
+        init_val = [tensor.alloc(data2npfloatX(0.), n_samples, self.dim),
+                    tensor.alloc(data2npfloatX(0.), n_samples, self.dim)]
+
+        state = (tensor.dot(x, self.nn_weights['W']) +
+                 self.nn_weights['b'])
+
+        layer_output, update = theano.scan(name='LSTMEncoder',
+                                           fn=self.encode_step,
+                                           sequences=[state, x_mask],
+                                           outputs_info=init_val,
+                                           non_sequences=None,
+                                           n_steps=nsteps)
+        return layer_output[0]
+
+
+class LSTMDecoderLayer(Core):
+    def __init__(self, dim):
+        Core.__init__(self)
+        # W, U is (n * 4n), b is (1 * 4n)
+        self.dim = dim
+        self.nn_weights = {}.fromkeys(['W', 'U', 'C', 'b'])
+
+        self.nn_weights['W'] = np2shared(get_4_ortho_weight(dim), 'W')
+        self.nn_weights['U'] = np2shared(get_4_ortho_weight(dim), 'U')
+        self.nn_weights['C'] = np2shared(get_4_ortho_weight(dim), 'C')
+        self.nn_weights['b'] = np2shared(numpy.zeros((4 * dim,)).astype(dtype), 'b')
+
+    def layer_decode_step(self, y_tm1, mask, h_tm1, c_tm1, context_vector):
+        preact = (tensor.dot(y_tm1, self.nn_weights['W']) +
+                  tensor.dot(h_tm1, self.nn_weights['U']) +
+                  tensor.dot(context_vector, self.nn_weights['C']) +
+                  self.nn_weights['b'])
+        # preact += state
+        # print(mask)
+
+        i = tensor.nnet.sigmoid(tensor_slice(preact, 0, self.dim))
+        f = tensor.nnet.sigmoid(tensor_slice(preact, 1, self.dim))
+        o = tensor.nnet.sigmoid(tensor_slice(preact, 2, self.dim))
+        c = tensor.tanh(tensor_slice(preact, 3, self.dim))
+
+        c = f * c_tm1 + i * c
+        # c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
+
+        h = o * tensor.tanh(c)
+        # h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
+
+        return h, c
+
+
 class Encoder:
-
-    class LSTMEncoderLayer:
-        def __init__(self, dim):
-            # W, U is (n * 4n), b is (1 * 4n)
-            self.dim = dim
-            self.nn_weights = {}.fromkeys(['W', 'U', 'b'])
-
-            self.nn_weights['W'] = np2shared(get_4_ortho_weight(dim), 'W')
-            self.nn_weights['U'] = np2shared(get_4_ortho_weight(dim), 'U')
-            self.nn_weights['b'] = np2shared(numpy.zeros((4 * dim,)).astype(dtype), 'b')
-
-
-        def encode_step(self, x, mask, h_tm1, c_tm1):
-            """
-            Basic Equation:
-                h(t), c(t) = LSTM(x(t), h(t-1), c(t-1))
-            """
-            preact = tensor.dot(h_tm1, self.nn_weights['U'])
-            preact += x
-
-            i = tensor.nnet.sigmoid(tensor_slice(preact, 0, self.dim))
-            f = tensor.nnet.sigmoid(tensor_slice(preact, 1, self.dim))
-            o = tensor.nnet.sigmoid(tensor_slice(preact, 2, self.dim))
-            c = tensor.tanh(tensor_slice(preact, 3, self.dim))
-
-            c = f * c_tm1 + i * c
-            c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
-
-            h = o * tensor.tanh(c)
-            h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
-
-            return h, c
-
-
-        def layer_encode(self, x, x_mask):
-            nsteps = x.shape[0]
-            if x.ndim == 3:
-                n_samples = x.shape[1]
-            else:
-                n_samples = 1
-
-            init_val = [tensor.alloc(data2npfloatX(0.), n_samples, self.dim),
-                        tensor.alloc(data2npfloatX(0.), n_samples, self.dim)]
-
-            state = (tensor.dot(x, self.nn_weights['W']) +
-                     self.nn_weights['b'])
-
-            layer_output, update = theano.scan(name          = 'LSTMEncoder',
-                                               fn            = self.encode_step,
-                                               sequences     = [state, x_mask],
-                                               outputs_info  = init_val,
-                                               non_sequences = None,
-                                               n_steps       = nsteps)
-            return layer_output[0]
-
-
-    class MLP:
-        def __init__(self, dim1, dim2, dim3):
-            self.dim1, self.dim2, self.dim3 = dim1, dim2, dim3
-            self.nn_weights = {}.fromkeys(['W1','W2','W3','b1','b2','b3'])
-
-            self.nn_weights['W1'] = np2shared(get_random_weights(dim1, dim2), 'W1')
-            self.nn_weights['W2'] = np2shared(get_random_weights(dim2, dim2), 'W2')
-            self.nn_weights['W3'] = np2shared(get_random_weights(dim2, dim3), 'W3')
-            self.nn_weights['b1'] = np2shared(numpy.zeros((dim2,)).astype(dtype), 'b1')
-            self.nn_weights['b2'] = np2shared(numpy.zeros((dim2,)).astype(dtype), 'b2')
-            self.nn_weights['b3'] = np2shared(numpy.zeros((dim3,)).astype(dtype), 'b3')
-
-
-        def mlp_encode(self, x):
-            h1 = tensor.nnet.relu(tensor.dot(x, self.nn_weights['W1']) + self.nn_weights['b1'])
-            h2 = tensor.nnet.relu(tensor.dot(h1, self.nn_weights['W2']) + self.nn_weights['b2'])
-            h3 = tensor.nnet.relu(tensor.dot(h2, self.nn_weights['W3']) + self.nn_weights['b3'])
-            return h3
-
-
     def __init__(self, enc_dim, mlp_dim1, mlp_dim2, mlp_dim3):
         self.enc_dim = enc_dim
+        self.enc_nlayers = 4
         self.mlp_dim1 = mlp_dim1
         self.mlp_dim2 = mlp_dim2
         self.mlp_dim3 = mlp_dim3
 
         assert 2 * self.enc_dim == self.mlp_dim1
-        
-        self.fenc_1 = Encoder.LSTMEncoderLayer(self.enc_dim)
-        self.fenc_2 = Encoder.LSTMEncoderLayer(self.enc_dim)
-        self.fenc_3 = Encoder.LSTMEncoderLayer(self.enc_dim)
-        self.fenc_4 = Encoder.LSTMEncoderLayer(self.enc_dim)
-        self.benc_1 = Encoder.LSTMEncoderLayer(self.enc_dim)
-        self.benc_2 = Encoder.LSTMEncoderLayer(self.enc_dim)
-        self.benc_3 = Encoder.LSTMEncoderLayer(self.enc_dim)
-        self.benc_4 = Encoder.LSTMEncoderLayer(self.enc_dim)
-        self.mlp_enc = Encoder.MLP(self.mlp_dim1, self.mlp_dim2, self.mlp_dim3)
+        self.layers = {'f_enc':[], 'benc':[]}
+        for i in range(0, self.enc_nlayers):
+            self.layers['f_enc'].append(LSTMEncoderLayer(self.enc_dim))
+            self.layers['b_enc'].append(LSTMEncoderLayer(self.enc_dim))
+
+        self.mlp_enc = MLP(self.mlp_dim1, self.mlp_dim2, self.mlp_dim3)
 
 
-    def encode(self, x, x_mask):
+    def encode(self, emb_x, x_mask):
 
-        emb_x = x
-        emb_rx = x
+        emb_rx = emb_x
         rx_mask = x_mask
 
-        fenc_h1 = self.fenc_1.layer_encode(emb_x, x_mask)
-        fenc_h2 = self.fenc_2.layer_encode(fenc_h1, x_mask)
-        fenc_h3 = self.fenc_3.layer_encode(fenc_h2, x_mask)
-        fenc_h4 = self.fenc_4.layer_encode(fenc_h3, x_mask)
-
-        benc_h1 = self.fenc_1.layer_encode(emb_rx, rx_mask)
-        benc_h2 = self.fenc_2.layer_encode(benc_h1, rx_mask)
-        benc_h3 = self.fenc_3.layer_encode(benc_h2, rx_mask)
-        benc_h4 = self.fenc_4.layer_encode(benc_h3, rx_mask)
+        fenc_h1 = self.layers['f_enc'][0].layer_encode(emb_x, x_mask)
+        fenc_h2 = self.layers['f_enc'][1].layer_encode(fenc_h1, x_mask)
+        fenc_h3 = self.layers['f_enc'][2].layer_encode(fenc_h2, x_mask)
+        fenc_h4 = self.layers['f_enc'][3].layer_encode(fenc_h3, x_mask)
+        
+        benc_h1 = self.layers['b_enc'][0].layer_encode(emb_rx, rx_mask)
+        benc_h2 = self.layers['b_enc'][1].layer_encode(benc_h1, rx_mask)
+        benc_h3 = self.layers['b_enc'][2].layer_encode(benc_h2, rx_mask)
+        benc_h4 = self.layers['b_enc'][3].layer_encode(benc_h3, rx_mask)
 
         enc_h = tensor.concatenate([fenc_h4[0], benc_h4[0]], axis=1)
 
         context_vector = self.mlp_enc.mlp_encode(enc_h)
 
-        return fenc_h4[0]
+        return context_vector
+
+
+    def weights2json(self):
+        layers = {}.fromkeys(self.layers.keys())
+        for kk in layers:
+            for i in range(0, self.enc_nlayers):
+                layers[kk].append(self.layers[kk][i].nn_weights2json())
+        layers.get()
+        return json.dumps(layers)
+
+
+    def json2weights(self, lstm_jsonstr, mlp_jsonstr):
+        layers = json.loads(lstm_jsonstr)
+        for kk in layers:
+            for i in range(0, self.enc_nlayers):
+                pass
 
 
 class Decoder:
-
-    class LSTMDecoderLayer:
-        def __init__(self, dim):
-            # W, U is (n * 4n), b is (1 * 4n)
-            self.dim = dim
-            self.nn_weights = {}.fromkeys(['W', 'U', 'C', 'b'])
-
-            self.nn_weights['W'] = np2shared(get_4_ortho_weight(dim), 'W')
-            self.nn_weights['U'] = np2shared(get_4_ortho_weight(dim), 'U')
-            self.nn_weights['C'] = np2shared(get_4_ortho_weight(dim), 'C')
-            self.nn_weights['b'] = np2shared(numpy.zeros((4 * dim,)).astype(dtype), 'b')
-
-
-        def layer_decode_step(self, y_tm1, mask, h_tm1, c_tm1, context_vector):
-            preact = (tensor.dot(y_tm1, self.nn_weights['W']) +
-                      tensor.dot(h_tm1, self.nn_weights['U']) +
-                      tensor.dot(context_vector, self.nn_weights['C']) +
-                      self.nn_weights['b'])
-            # preact += state
-            # print(mask)
-
-            i = tensor.nnet.sigmoid(tensor_slice(preact, 0, self.dim))
-            f = tensor.nnet.sigmoid(tensor_slice(preact, 1, self.dim))
-            o = tensor.nnet.sigmoid(tensor_slice(preact, 2, self.dim))
-            c = tensor.tanh(tensor_slice(preact, 3, self.dim))
-
-            c = f * c_tm1 + i * c
-            #c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
-
-            h = o * tensor.tanh(c)
-            #h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
-
-            return h, c
-
-
     def __init__(self, dec_dim, dec_steps=100):
         self.dec_dim = dec_dim
-        self.lstm_dec_n_layers = 4
+        self.dec_nlayers = 4
         self.dec_steps = dec_steps
+        self.layers = {'dec':[]}
 
-        self.dec_layer_1 = Decoder.LSTMDecoderLayer(self.dec_dim)
-        self.dec_layer_2 = Decoder.LSTMDecoderLayer(self.dec_dim)
-        self.dec_layer_3 = Decoder.LSTMDecoderLayer(self.dec_dim)
-        self.dec_layer_4 = Decoder.LSTMDecoderLayer(self.dec_dim)
+        for i in range(0, self.dec_nlayers):
+            self.layers['dec'].append(LSTMDecoderLayer(self.dec_dim))
 
 
     def _get_init_state(self, batch_size):
@@ -265,10 +313,11 @@ class Decoder:
                     h1_tm1, h2_tm1, h3_tm1, h4_tm1,
                     context_vector):
         mask = 0
-        h1, c1 = self.dec_layer_1.layer_decode_step(y_tm1, mask, h1_tm1, c1_tm1, context_vector)
-        h2, c2 = self.dec_layer_1.layer_decode_step(h1, mask, h2_tm1, c2_tm1, context_vector)
-        h3, c3 = self.dec_layer_1.layer_decode_step(h2, mask, h3_tm1, c3_tm1, context_vector)
-        h4, c4 = self.dec_layer_1.layer_decode_step(h3, mask, h4_tm1, c4_tm1, context_vector)
+
+        h1, c1 = self.layers['dec'][0].layer_decode_step(y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+        h2, c2 = self.layers['dec'][0].layer_decode_step(h1, mask, h2_tm1, c2_tm1, context_vector)
+        h3, c3 = self.layers['dec'][0].layer_decode_step(h2, mask, h3_tm1, c3_tm1, context_vector)
+        h4, c4 = self.layers['dec'][0].layer_decode_step(h3, mask, h4_tm1, c4_tm1, context_vector)
 
         y = h4 #TODO: convert to y
         return (y,
@@ -310,12 +359,25 @@ class Seq2Seq:
         #return prob_pred_seq, pred_seq
 
 
-    def save_model(self):
-        pass
+    def save_model(self, filepath):
+        container = {}.fromkeys(['lstm_encoder','mlp','decoder'])
+
+        container['lstm_encoder'],  container['mlp_encoder']= self.encoder.weights2json()
+        container['decoder'] = self.decoder #TODO
+
+        model_json = json.dumps(container)
+
+        with open(filepath, 'w') as outputs:
+            outputs.write(model_json)
 
 
-    def load_model(self):
-        pass
+    def load_model(self, filepath):       
+        with open(filepath, 'r') as inputs:
+            model_json = inputs.read()
+        
+        container = json.loads(model_json)
+        self.encoder.json2weights(container['lstm_encoder'], container['mlp_encoder'])
+        #TODO
 
 
 class SAE(Seq2Seq): #TODO
@@ -330,6 +392,7 @@ class SAE(Seq2Seq): #TODO
 class DAE(Seq2Seq): #TODO
     def __init__(self, params):
         Seq2Seq.__init__(self, params)
+        self.sae = SAE(params)
 
 
     def build_model(self, x, x_mask):
