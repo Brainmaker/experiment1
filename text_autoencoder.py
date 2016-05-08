@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
   ------ Text Autoencoder ------
-  Created by Xiaolin Wan, 5.4.2016
+  Updated by Xiaolin Wan, 5.8.2016
 
   Build a deeply document autoencoder with Bi-LSTM.
   We adopt a Bi-LSTM structure with four layer for encoding and four layer for decoding,
