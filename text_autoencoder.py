@@ -58,8 +58,8 @@ def tensor_slice(x, slice_tag, dim):
     return x[:, slice_tag*dim : (slice_tag+1)*dim]
 
 
-def dropout_layer(state_before, use_noise, trng_=trng):
-    proj = tensor.switch(cond = use_noise,
+def dropout_layer(state_before, trng_=trng):
+    proj = tensor.switch(cond = theano.shared(data2npfloatX(0.)),
                          ift  = (state_before * trng_.binomial(state_before.shape,p=0.5, n=1,dtype=state_before.dtype)), # ift
                          iff  = state_before * 0.5)
     return proj
@@ -133,17 +133,11 @@ class MLP(Core):
 
     def mlp_encode(self, x):
         h1 = tensor.nnet.relu(tensor.dot(x, self.nn_weights['W1']) + self.nn_weights['b1'])
+        #proj1 = dropout_layer(h1)
         h2 = tensor.nnet.relu(tensor.dot(h1, self.nn_weights['W2']) + self.nn_weights['b2'])
+        #proj2 = dropout_layer(h2)
         h3 = tensor.nnet.relu(tensor.dot(h2, self.nn_weights['W3']) + self.nn_weights['b3'])
         return h3
-
-
-    def weights2json(self):
-        return nn_weights2json(self.nn_weights)
-
-
-    def json2weights(self, jsonstr):
-        self.nn_weights = json2nn_weights(jsonstr)
 
 
 class LSTMEncoderLayer(Core):
@@ -197,6 +191,8 @@ class LSTMEncoderLayer(Core):
                                            outputs_info=init_val,
                                            non_sequences=None,
                                            n_steps=nsteps)
+        # Use Dropout
+        #return dropout_layer(layer_output[0])
         return layer_output[0]
 
 
@@ -234,6 +230,26 @@ class LSTMDecoderLayer(Core):
         return h, c
 
 
+class WordOutputLayer(Core):
+    def __init__(self, dec_dim, vocab_size=120000):
+        Core.__init__(self)
+        self.nn_weights = {}.fromkeys(['U0', 'E0', 'C0', 'W0'])
+        self.nn_weights['U0'] = get_random_weights(dec_dim, dec_dim)
+        self.nn_weights['E0'] = get_random_weights(vocab_size, dec_dim)
+        self.nn_weights['C0'] = get_random_weights(dec_dim, dec_dim)
+        self.nn_weights['W0'] = get_random_weights(dec_dim, vocab_size)
+
+
+    def forward(self, h, y_tm1, context_vector):
+        t_bar = (tensor.dot(h, self.nn_weights['U0']) +
+                 tensor.dot(y_tm1, self.nn_weights['E0']) +
+                 tensor.dot(context_vector, self.nn_weights['C0']))
+        t = t_bar #TODO: 2-maxout layer, the size of t_bar should be 2*dec_dim, here we use size(t_bar) = dec_dim
+        prob_y = tensor.nnet.softmax(tensor.dot(t, self.nn_weights['W0']))
+        y = prob_y #TODO: argmax
+        return prob_y, y
+
+
 class Encoder:
     def __init__(self, enc_dim, mlp_dim1, mlp_dim2, mlp_dim3):
         self.enc_dim = enc_dim
@@ -267,26 +283,28 @@ class Encoder:
         benc_h4 = self.layers['b_enc'][3].layer_encode(benc_h3, rx_mask)
 
         enc_h = tensor.concatenate([fenc_h4[0], benc_h4[0]], axis=1)
-
-        context_vector = self.mlp_enc.mlp_encode(enc_h)
+        # Use Dropout
+        proj = dropout_layer(enc_h)
+        context_vector = self.mlp_enc.mlp_encode(proj)
 
         return context_vector
 
 
     def weights2json(self):
-        layers = {}.fromkeys(self.layers.keys())
-        for kk in layers:
-            for i in range(0, self.enc_nlayers):
-                layers[kk].append(self.layers[kk][i].nn_weights2json())
-        layers.get()
+        layers = {'f_enc':[],'b_enc':[],'mlp_enc':[]}
+        layers['mlp_enc'].append(self.mlp_enc.nn_weights2json())
+        for i in range(0, self.enc_nlayers):
+            layers['f_enc'].append(self.layers['f_enc'][i].nn_weights2json())
+            layers['b_enc'].append(self.layers['b_enc'][i].nn_weights2json())
         return json.dumps(layers)
 
 
-    def json2weights(self, lstm_jsonstr, mlp_jsonstr):
-        layers = json.loads(lstm_jsonstr)
-        for kk in layers:
-            for i in range(0, self.enc_nlayers):
-                pass
+    def json2weights(self, jsonstr):
+        layers = json.loads(jsonstr)
+        self.mlp_enc.json2nn_weights(layers['mlp_enc'])
+        for i in range(0, self.enc_nlayers):
+            self.layers['f_enc'][i].json2nn_weights(layers['f_enc'])
+            self.layers['b_enc'][i].json2nn_weights(layers['b_enc'])
 
 
 class Decoder:
@@ -337,6 +355,61 @@ class Decoder:
         return pred_h
 
 
+    def weights2json(self):
+        layers = {'dec':[]}
+        for i in range(0, self.dec_nlayers):
+            layers['dec'].append(self.layers['dec'][i].nn_weights2json)
+        return json.dumps(layers)
+
+
+    def json2weights(self, jsonstr):
+        layers = json.loads(jsonstr)
+        for i in range(0, self.dec_nlayers):
+            self.layers['dec'][i].json2nn_weights(layers['dec'][i])
+
+
+class WordDecoder(Decoder):
+    def __init__(self, dec_dim, vocab_size, dec_nsteps=100):
+        Decoder.__init__(self, dec_dim, dec_nsteps)
+        self.layers['output_layer'] = WordOutputLayer(dec_dim, vocab_size)
+
+
+    def decode_step(self, y_tm1,
+                        c1_tm1, c2_tm1, c3_tm1, c4_tm1,
+                        h1_tm1, h2_tm1, h3_tm1, h4_tm1,
+                        context_vector):
+        mask = 0
+        emb_y_tm1 = y_tm1 #TODO:
+        h1, c1 = self.layers['dec'][0].layer_decode_step(emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+        h2, c2 = self.layers['dec'][0].layer_decode_step(h1, mask, h2_tm1, c2_tm1, context_vector)
+        h3, c3 = self.layers['dec'][0].layer_decode_step(h2, mask, h3_tm1, c3_tm1, context_vector)
+        h4, c4 = self.layers['dec'][0].layer_decode_step(h3, mask, h4_tm1, c4_tm1, context_vector)
+
+        prob_y, y =  self.layers['output_layer'].forward(h4, y_tm1, context_vector)
+        return (y,
+                c1, c2, c3, c4,
+                h1, h2, h3, h4)
+
+
+    def weights2json(self):
+        layers = {'dec': [], 'output_layer':None}
+        for i in range(0, self.dec_nlayers):
+            layers['dec'].append(self.layers['dec'][i].nn_weights2json())
+        layers['output_layer'] = self.layers['output_layer'].nn_weights2json()
+        return json.dumps(layers)
+
+    def json2weights(self, jsonstr):
+        layers = json.loads(jsonstr)
+        for i in range(0, self.dec_nlayers):
+            self.layers['dec'][i].json2nn_weights(layers['dec'][i])
+        self.layers['output_layer'].json2nn_weights(layers['output_layer'])
+
+
+class SentDecoder(Decoder):
+    def __init__(self, dec_dim, dec_steps=100):
+        Decoder.__init__(self, dec_dim, dec_steps=100)
+
+
 class Seq2Seq:
     def __init__(self, params):
         assert 2 * params['enc_dim'] == params['mlp_dim1']
@@ -351,42 +424,49 @@ class Seq2Seq:
                                dec_steps = params['dec_steps'])
 
 
-    def build_model(self, x, x_mask):
-        context_vectors = self.encoder.encode(x, x_mask)
-        prob_pred_seq = self.decoder.decode(context_vectors)
+    def build_model(self, emb_x, x_mask):
+        context_vectors = self.encoder.encode(emb_x, x_mask)
+        # Use Dropout
+        proj = dropout_layer(context_vectors)
+        prob_pred_seq = self.decoder.decode(proj)
+
+        #prob_pred_seq = self.decoder.decode(context_vectors)
+
         return prob_pred_seq
         #pred_seq = prob_pred_seq #TODO
         #return prob_pred_seq, pred_seq
 
 
     def save_model(self, filepath):
-        container = {}.fromkeys(['lstm_encoder','mlp','decoder'])
+        container = {}.fromkeys(['encoder', 'decoder'])
 
-        container['lstm_encoder'],  container['mlp_encoder']= self.encoder.weights2json()
-        container['decoder'] = self.decoder #TODO
+        container['encoder'] = self.encoder.weights2json()
+        container['decoder'] = self.decoder.weights2json()
 
         model_json = json.dumps(container)
-
         with open(filepath, 'w') as outputs:
             outputs.write(model_json)
 
 
-    def load_model(self, filepath):       
+    def load_model(self, filepath):
         with open(filepath, 'r') as inputs:
             model_json = inputs.read()
-        
-        container = json.loads(model_json)
-        self.encoder.json2weights(container['lstm_encoder'], container['mlp_encoder'])
-        #TODO
+            container = json.loads(model_json)
+            self.encoder.json2weights(container['encoder'])
+            self.decoder.json2weights(container['decoder'])
 
 
 class SAE(Seq2Seq): #TODO
     def __init__(self, params):
         Seq2Seq.__init__(self, params)
+        self.vocab_size = params['vocab_size']
+        self.nn_weights = {}.fromkeys(['embedding'])
+        self.nn_weights['embedding'] = get_random_weights(self.vocab_size, self.encoder.enc_dim)
 
 
-    def build_model(self, x, x_mask):
-        pass
+    def build_sae(self, x, x_mask):
+        emb_x = tensor.dot(x, self.nn_weights['embedding'])
+        self.build_model(emb_x, x_mask)
 
 
 class DAE(Seq2Seq): #TODO
@@ -397,3 +477,4 @@ class DAE(Seq2Seq): #TODO
 
     def build_model(self, x, x_mask):
         pass
+      
