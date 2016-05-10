@@ -35,5 +35,6 @@ trainig_parameters = {
     # Extra option
     'disp_freq',
     'save_freq',
+    'loadfrom'
     'saveto',
 }
