@@ -11,8 +11,6 @@
   Draft* Do NOT cite.
 """
 
-import sys
-import time
 import json
 
 import numpy
@@ -55,11 +53,15 @@ class Core:
         return x[:, slice_tag * dim: (slice_tag + 1) * dim]
 
     @staticmethod
-    def dropout(state_before, trng_=trng):
-        proj = tensor.switch(cond = theano.shared(data2npfloatX(0.)),
-                             ift  = (state_before * trng_.binomial(state_before.shape, p=0.5, n=1, dtype=state_before.dtype)),
-                             iff  = state_before * 0.5)
+    def dropout(state_before):
+        proj = tensor.switch(theano.shared(data2npfloatX(0.)),
+                             state_before * trng.binomial(state_before.shape, p=0.5, n=1, dtype=state_before.dtype),
+                             state_before * 0.5)
         return proj
+
+    # @staticmethod
+    # def dropout(self):
+    #     return self
 
     def params2json(self):
         params = {}.fromkeys(self.params.keys())
@@ -102,10 +104,10 @@ class OutputLayer(Core):
         Core.__init__(self, ['U0','E0','C0','W0'])
         self.dec_dim = dec_dim
         self.vocab_size = vocab_size
-        self.params['U0'] = Core.get_random_weights(self.dec_dim, self.dec_dim)
-        self.params['E0'] = Core.get_random_weights(self.vocab_size, self.dec_dim)
-        self.params['C0'] = Core.get_random_weights(self.dec_dim, self.dec_dim)
-        self.params['W0'] = Core.get_random_weights(self.dec_dim, self.vocab_size)
+        self.params['U0'] = Core.get_random_weights(self.dec_dim, self.dec_dim, name='U0')
+        self.params['E0'] = Core.get_random_weights(self.vocab_size, self.dec_dim, name='E0')
+        self.params['C0'] = Core.get_random_weights(self.dec_dim, self.dec_dim, name='C0')
+        self.params['W0'] = Core.get_random_weights(self.dec_dim, self.vocab_size, name='W0')
 
     def forward(self, y_tm1, h, context_vector):
         t_bar = (tensor.dot(h, self.params['U0']) +
@@ -181,7 +183,7 @@ class BiLSTMEncodeLayer(Core):
                   self.params['f_b'])
 
         bstate = (tensor.dot(bstate_below, self.params['b_W']) +
-                  tensor.dot(emb_x, self.params['b_V']) +
+                  tensor.dot(emb_rx, self.params['b_V']) +
                   self.params['b_b'])
 
         fstate_current, update = theano.scan(name          = 'LSTMForwardEncoder',
@@ -192,8 +194,8 @@ class BiLSTMEncodeLayer(Core):
                                              n_steps       = nsteps)
 
         bstate_current, update = theano.scan(name          = 'LSTMBackwardEncoder',
-                                             fn            = self.f_step,
-                                             sequences     = [fstate, x_mask],
+                                             fn            = self.b_step,
+                                             sequences     = [bstate, rx_mask],
                                              outputs_info  = init_val,
                                              non_sequences = None,
                                              n_steps       = nsteps)
@@ -211,7 +213,7 @@ class LSTMDecodeLayer(Core):
         self.params['C'] = Core.get_4_ortho_weights(self.dim, name='C')
         self.params['b'] = Core.get_zero_bias(4 * self.dim, name='b')
 
-    def forward(self, state_below, emb_y_tm1, h_tm1, c_tm1, context_vector):
+    def forward(self, state_below, emb_y_tm1, mask, h_tm1, c_tm1, context_vector):
         preact = (tensor.dot(state_below, self.params['W']) +
                   tensor.dot(emb_y_tm1, self.params['V']) +
                   tensor.dot(h_tm1, self.params['U']) +
@@ -224,7 +226,9 @@ class LSTMDecodeLayer(Core):
         c = tensor.tanh(Core.slice_4(preact, 3, self.dim))
 
         c = f * c_tm1 + i * c
+        #c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1 TODO:
         h = o * tensor.tanh(c)
+        #h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1 TODO:
 
         return h, c
 
@@ -232,8 +236,6 @@ class LSTMDecodeLayer(Core):
 class SubModule:
     def __init__(self, layers_name):
         self.layers = {}.fromkeys(layers_name)
-
-
 
     def layers2json(self):
         container = {}.fromkeys(self.layers.keys())
@@ -249,7 +251,7 @@ class SubModule:
 
 
 class Encoder(SubModule):
-    def __init__(self, enc_dim, use_dropout=False):
+    def __init__(self, enc_dim, use_dropout):
         SubModule.__init__(self, ['enc_1','enc_2','enc_3','enc_4'])
         self.use_dropout = use_dropout
         self.enc_dim = enc_dim
@@ -264,19 +266,16 @@ class Encoder(SubModule):
 
         if self.use_dropout:
             fh1, bh1 = self.layers['enc_1'].forward(emb_x, emb_rx, emb_x, emb_rx, x_mask, rx_mask)
-            fproj1, bproj1 = Core.dropout(fh1), Core.dropout(bh1)
-            fh2, bh2 = self.layers['enc_2'].forward(emb_x, emb_rx, fproj1, bproj1, x_mask, rx_mask)
-            fproj2, bproj2 = Core.dropout(fh2), Core.dropout(bh2)
-            fh3, bh3 = self.layers['enc_3'].forward(emb_x, emb_rx, fproj2, bproj2, x_mask, rx_mask)
-            fproj3, bproj3 = Core.dropout(fh3), Core.dropout(bh3)
-            fh4, bh4 = self.layers['enc_4'].forward(emb_x, emb_rx, fproj3, bproj3, x_mask, rx_mask)
+            fh2, bh2 = self.layers['enc_2'].forward(emb_x, emb_rx, Core.dropout(fh1), Core.dropout(bh1), x_mask, rx_mask)
+            fh3, bh3 = self.layers['enc_3'].forward(emb_x, emb_rx, Core.dropout(fh2), Core.dropout(bh2), x_mask, rx_mask)
+            fh4, bh4 = self.layers['enc_4'].forward(emb_x, emb_rx, Core.dropout(fh3), Core.dropout(bh3), x_mask, rx_mask)
         else:
             fh1, bh1 = self.layers['enc_1'].forward(emb_x, emb_rx, emb_x, emb_rx, x_mask, rx_mask)
             fh2, bh2 = self.layers['enc_2'].forward(emb_x, emb_rx, fh1, bh1, x_mask, rx_mask)
             fh3, bh3 = self.layers['enc_3'].forward(emb_x, emb_rx, fh2, bh2, x_mask, rx_mask)
             fh4, bh4 = self.layers['enc_4'].forward(emb_x, emb_rx, fh3, bh3, x_mask, rx_mask)
 
-        return tensor.concatenate([fh4, bh4], axis=1)
+        return tensor.concatenate([fh4[0], bh4[0]], axis=1)
 
 
 class Decoder(SubModule):
@@ -300,23 +299,21 @@ class Decoder(SubModule):
               c1_tm1, c2_tm1, c3_tm1, c4_tm1,
               h1_tm1, h2_tm1, h3_tm1, h4_tm1,
               context_vector):
+        mask = 1
         if self.use_dropout:
-            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, h1_tm1, c1_tm1, context_vector)
-            proj1 = Core.dropout(h1)
-            h2, c2 = self.layers['dec_2'].forward(proj1, emb_y_tm1, h2_tm1, c2_tm1, context_vector)
-            proj2 = Core.dropout(h2)
-            h3, c3 = self.layers['dec_3'].forward(proj2, emb_y_tm1, h3_tm1, c3_tm1, context_vector)
-            proj3 = Core.dropout(h3)
-            h4, c4 = self.layers['dec_4'].forward(proj3, emb_y_tm1, h4_tm1, c4_tm1, context_vector)
+            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+            h2, c2 = self.layers['dec_2'].forward(Core.dropout(h1), emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
+            h3, c3 = self.layers['dec_3'].forward(Core.dropout(h2), emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
+            h4, c4 = self.layers['dec_4'].forward(Core.dropout(h3), emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
+            emb_y = h4
+            return emb_y, c1, c2, c3, c4, h1, h2, h3, h4
         else:
-            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, h1_tm1, c1_tm1, context_vector)
-            h2, c2 = self.layers['dec_2'].forward(h1, emb_y_tm1, h2_tm1, c2_tm1, context_vector)
-            h3, c3 = self.layers['dec_3'].forward(h2, emb_y_tm1, h3_tm1, c3_tm1, context_vector)
-            h4, c4 = self.layers['dec_4'].forward(h3, emb_y_tm1, h4_tm1, c4_tm1, context_vector)
-        emb_y = h4
-        return (emb_y,
-                c1, c2, c3, c4,
-                h1, h2, h3, h4)
+            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+            h2, c2 = self.layers['dec_2'].forward(h1, emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
+            h3, c3 = self.layers['dec_3'].forward(h2, emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
+            h4, c4 = self.layers['dec_4'].forward(h3, emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
+            emb_y = h4
+            return emb_y, c1, c2, c3, c4, h1, h2, h3, h4
 
 
     def decode(self, context_vector):
@@ -325,12 +322,13 @@ class Decoder(SubModule):
         rval, updates = theano.scan(name          = 'Decoder',
                                     fn            = self._step,
                                     outputs_info  = init_state,
-                                    non_sequences = [context_vector],
+                                    non_sequences = context_vector,
                                     n_steps       = self.dec_nsteps)
+        return rval[0]
 
 
 class WordEncoder(Encoder):
-    def __init__(self, enc_dim, vocab_size, use_dropout):
+    def __init__(self, enc_dim, vocab_size, use_dropout=True):
         Encoder.__init__(self, enc_dim, use_dropout)
         self.vocab_dim = vocab_size
         self.layers['word_embedding'] = WordEmbeddingLayer(enc_dim, vocab_size)
@@ -345,13 +343,13 @@ class WordEncoder(Encoder):
 
 
 class SentEncoder(Encoder):
-    def __init__(self, enc_dim, use_dropout):
+    def __init__(self, enc_dim, use_dropout=True):
         Encoder.__init__(self, enc_dim, use_dropout)
 
 
 class WordDecoder(Decoder):
-    def __init__(self, dec_dim, vocab_size, dec_nsteps, use_dropout, word_emb_layer):
-        Decoder.__init__(dec_dim, dec_nsteps, use_dropout)
+    def __init__(self, dec_dim, vocab_size, dec_nsteps, word_emb_layer, use_dropout=True):
+        Decoder.__init__(self, dec_dim, dec_nsteps, use_dropout)
         self.vocab_size = vocab_size
         self.layers['output_layer'] = OutputLayer(self.dec_dim, self.vocab_size)
         self.word_emb_layer = word_emb_layer
@@ -362,34 +360,69 @@ class WordDecoder(Decoder):
               context_vector):
         emb_y_tm1 = self.word_emb_layer.forward(y_tm1)
         
+        mask = 1
         if self.use_dropout:
-            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, h1_tm1, c1_tm1, context_vector)
-            proj1 = Core.dropout(h1)
-            h2, c2 = self.layers['dec_2'].forward(proj1, emb_y_tm1, h2_tm1, c2_tm1, context_vector)
-            proj2 = Core.dropout(h2)
-            h3, c3 = self.layers['dec_3'].forward(proj2, emb_y_tm1, h3_tm1, c3_tm1, context_vector)
-            proj3 = Core.dropout(h3)
-            h4, c4 = self.layers['dec_4'].forward(proj3, emb_y_tm1, h4_tm1, c4_tm1, context_vector)
-        else:
-            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, h1_tm1, c1_tm1, context_vector)
-            h2, c2 = self.layers['dec_2'].forward(h1, emb_y_tm1, h2_tm1, c2_tm1, context_vector)
-            h3, c3 = self.layers['dec_3'].forward(h2, emb_y_tm1, h3_tm1, c3_tm1, context_vector)
-            h4, c4 = self.layers['dec_4'].forward(h3, emb_y_tm1, h4_tm1, c4_tm1, context_vector)
+            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+            h2, c2 = self.layers['dec_2'].forward(Core.dropout(h1), emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
+            h3, c3 = self.layers['dec_3'].forward(Core.dropout(h2), emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
+            h4, c4 = self.layers['dec_4'].forward(Core.dropout(h3), emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
 
-        y = self.layers['output_layer'].forward(y_tm1, h4, context_vector)
-        return (y,
-                c1, c2, c3, c4,
-                h1, h2, h3, h4)
+            # TODO: 若y中有终止符，则mask = 0
+            prob_y, y = self.layers['output_layer'].forward(y_tm1, Core.dropout(h4), context_vector)
+
+            return y, c1, c2, c3, c4, h1, h2, h3, h4
+        else:
+            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+            h2, c2 = self.layers['dec_2'].forward(h1, emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
+            h3, c3 = self.layers['dec_3'].forward(h2, emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
+            h4, c4 = self.layers['dec_4'].forward(h3, emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
+
+            #TODO: 若y中有终止符，则mask = 0
+            prob_y, y = self.layers['output_layer'].forward(y_tm1, h4, context_vector)
+
+            return y, c1, c2, c3, c4, h1, h2, h3, h4
 
 
 class SentDecoder(Decoder):
-    def __init__(self, dec_dim, dec_nsteps, use_dropout):
+    def __init__(self, dec_dim, dec_nsteps, use_dropout=True):
         Decoder.__init__(self, dec_dim, dec_nsteps, use_dropout)
 
 
 class SAE:
-    pass
+    def __init__(self, vocab_size, enc_dim, dec_dim, dec_nsteps):
+        self.vocab_size = vocab_size
+        self.enc_dim = enc_dim
+        self.dec_dim = dec_dim # 测试时令dec_dim = 2*enc_dim
+        self.dec_nsteps = dec_nsteps
+        self.encoder = WordEncoder(self.enc_dim, self.vocab_size, use_dropout=True)
+        word_emb_layer = self.encoder.layers['word_embedding']
+        self.decoder = WordDecoder(self.dec_dim, self.vocab_size, self.dec_nsteps, word_emb_layer, use_dropout=False)
+
+    def get_word_context_vector(self, x, x_mask):
+        return self.encoder.word_encode(x, x_mask)
+
+    def decoder_word_context_vector(self, context_vector):
+        return self.decoder.decode(context_vector)
+
+    def forward(self, x, x_mask):
+        context_vector = self.encoder.word_encode(x, x_mask)
+        pred = self.decoder.decode(context_vector)
+        return pred
 
 
 class DAE:
-    pass
+    def __init__(self, vocab_size, word_enc_dim, sent_enc_dim, word_dec_dim, sent_dec_dim, dec_nsteps):
+        self.vocab_size, self.word_enc_dim, self.sent_enc_dim, self.word_dec_dim, self.sent_dec_dim, self.dec_nsteps\
+        = vocab_size, word_enc_dim, sent_enc_dim, word_dec_dim, sent_dec_dim, dec_nsteps
+        self.sae = SAE(self.vocab_size, self.word_enc_dim, self.word_dec_dim, self.dec_nsteps)
+        self.sent_enc = SentEncoder(self.sent_enc_dim, use_dropout=True)
+        self.sent_dec = SentDecoder(self.sent_dec_dim, self.dec_nsteps, use_dropout=False)
+
+    def get_sent_context_vector(self, x, x_mask):
+        pass
+
+    def decode_sent_context_vector(self, context_vector):
+        pass
+
+    def forward(self, x, x_mask):
+        pass
