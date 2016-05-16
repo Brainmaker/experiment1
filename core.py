@@ -9,6 +9,7 @@ import theano
 import theano.tensor as tensor
 from theano.sandbox.rng_mrg import MRG_RandomStreams
 
+EPS = 1e-6
 TRNG = MRG_RandomStreams(seed=888)
 DTYPE = theano.config.floatX
 
@@ -17,26 +18,26 @@ def dtype_cast(data):
     return numpy.asarray(data, dtype=DTYPE)
 
 
-def get_random_weights(dim1, dim2, name=None):
-    w = numpy.random.randn(dim1, dim2)
-    return theano.shared(w.astype(DTYPE), name=name)
-
-
-def get_zero_bias(dim, name=None):
-    return theano.shared(numpy.zeros((dim,)).astype(DTYPE), name=name)
-
-
-def get_4_ortho_weights(dim, name=None):
-    u, s, v = numpy.linalg.svd(numpy.random.randn(dim, dim))
-    ortho_weight = numpy.concatenate([u, u, u, u], axis=1)
-    return theano.shared(ortho_weight.astype(DTYPE), name=name)
-
-
 def dropout(state_before):
     proj = tensor.switch(theano.shared(dtype_cast(0.)),
                          state_before * TRNG.binomial(state_before.shape, p=0.5, n=1, dtype=state_before.dtype),
                          state_before * 0.5)
     return proj
+
+
+def _get_random_weights(dim1, dim2, name=None):
+    w = numpy.random.randn(dim1, dim2)
+    return theano.shared(w.astype(DTYPE), name=name)
+
+
+def _get_zero_bias(dim, name=None):
+    return theano.shared(numpy.zeros((dim,)).astype(DTYPE), name=name)
+
+
+def _get_4_ortho_weights(dim, name=None):
+    u, s, v = numpy.linalg.svd(numpy.random.randn(dim, dim))
+    ortho_weight = numpy.concatenate([u, u, u, u], axis=1)
+    return theano.shared(ortho_weight.astype(DTYPE), name=name)
 
 
 def _slice_4(x, slice_tag, dim):
@@ -70,8 +71,8 @@ class Dense(Core):
         Core.__init__(self, ['W', 'b'])
         self.dim1 = dim1
         self.dim2 = dim2
-        self.tparams['W'] = get_random_weights(self.dim1, self.dim2, name='W')
-        self.tparams['b'] = get_zero_bias(self.dim2, name='b')
+        self.tparams['W'] = _get_random_weights(self.dim1, self.dim2, name='W')
+        self.tparams['b'] = _get_zero_bias(self.dim2, name='b')
 
     def forward(self, state_below):
         return tensor.dot(state_below, self.tparams['W']) + self.tparams['b']
@@ -82,7 +83,7 @@ class WordEmbeddingLayer(Core):
         Core.__init__(self, ['E'])
         self.embedding_dim = embedding_dim
         self.vocab_size = vocab_size
-        self.tparams['E'] = get_random_weights(vocab_size, embedding_dim, name='E')
+        self.tparams['E'] = _get_random_weights(vocab_size, embedding_dim, name='E')
 
     def forward(self, one_hot_input):
         return tensor.dot(one_hot_input, self.tparams['E'])
@@ -90,13 +91,13 @@ class WordEmbeddingLayer(Core):
 
 class OutputLayer(Core):
     def __init__(self, dec_dim, vocab_size):
-        Core.__init__(self, ['U0','E0','C0','W0'])
+        Core.__init__(self, ['U0', 'E0', 'C0', 'W0'])
         self.dec_dim = dec_dim
         self.vocab_size = vocab_size
-        self.tparams['U0'] = get_random_weights(self.dec_dim, self.dec_dim, name='U0')
-        self.tparams['E0'] = get_random_weights(self.vocab_size, self.dec_dim, name='E0')
-        self.tparams['C0'] = get_random_weights(self.dec_dim, self.dec_dim, name='C0')
-        self.tparams['W0'] = get_random_weights(self.dec_dim, self.vocab_size, name='W0')
+        self.tparams['U0'] = _get_random_weights(self.dec_dim, self.dec_dim, name='U0')
+        self.tparams['E0'] = _get_random_weights(self.vocab_size, self.dec_dim, name='E0')
+        self.tparams['C0'] = _get_random_weights(self.dec_dim, self.dec_dim, name='C0')
+        self.tparams['W0'] = _get_random_weights(self.dec_dim, self.vocab_size, name='W0')
 
     def forward(self, y_tm1, h, context_vector):
         t_bar = (tensor.dot(h, self.tparams['U0']) +
@@ -106,23 +107,23 @@ class OutputLayer(Core):
         prob_y = tensor.nnet.softmax(tensor.dot(t, self.tparams['W0']))
         y_idx = tensor.argmax(prob_y, axis=1)
         y = theano.tensor.extra_ops.to_one_hot(y_idx, self.vocab_size, dtype=DTYPE)
-        return y, y_idx
+        return y, prob_y
 
 
 class BiLSTMEncodeLayer(Core):
     def __init__(self, dim):
-        Core.__init__(self, ['f_W','f_U','f_V','f_b',
-                             'b_W','b_U','b_V','b_b'])
+        Core.__init__(self, ['f_W', 'f_U', 'f_V', 'f_b',
+                             'b_W', 'b_U', 'b_V', 'b_b'])
         self.dim = dim
-        self.tparams['f_W'] = get_4_ortho_weights(self.dim, name='f_W')
-        self.tparams['f_U'] = get_4_ortho_weights(self.dim, name='f_U')
-        self.tparams['f_V'] = get_4_ortho_weights(self.dim, name='f_V')
-        self.tparams['f_b'] = get_zero_bias(4 * self.dim, name='f_b')
+        self.tparams['f_W'] = _get_4_ortho_weights(self.dim, name='f_W')
+        self.tparams['f_U'] = _get_4_ortho_weights(self.dim, name='f_U')
+        self.tparams['f_V'] = _get_4_ortho_weights(self.dim, name='f_V')
+        self.tparams['f_b'] = _get_zero_bias(4 * self.dim, name='f_b')
 
-        self.tparams['b_W'] = get_4_ortho_weights(self.dim, name='b_W')
-        self.tparams['b_U'] = get_4_ortho_weights(self.dim, name='b_U')
-        self.tparams['b_V'] = get_4_ortho_weights(self.dim, name='b_V')
-        self.tparams['b_b'] = get_zero_bias(4 * self.dim, name='b_b')
+        self.tparams['b_W'] = _get_4_ortho_weights(self.dim, name='b_W')
+        self.tparams['b_U'] = _get_4_ortho_weights(self.dim, name='b_U')
+        self.tparams['b_V'] = _get_4_ortho_weights(self.dim, name='b_V')
+        self.tparams['b_b'] = _get_zero_bias(4 * self.dim, name='b_b')
 
     def f_step(self, x, mask, h_tm1, c_tm1):
         preact = tensor.dot(h_tm1, self.tparams['f_U'])
@@ -176,32 +177,36 @@ class BiLSTMEncodeLayer(Core):
                   tensor.dot(emb_rx, self.tparams['b_V']) +
                   self.tparams['b_b'])
 
-        fstate_current, update = theano.scan(name          = 'LSTMForwardEncoder',
-                                             fn            = self.f_step,
-                                             sequences     = [fstate, x_mask],
-                                             outputs_info  = init_val,
-                                             non_sequences = None,
-                                             n_steps       = nsteps)
+        fstate_current, _ = theano.scan(
+            name          = 'LSTMForwardEncoder',
+            fn            = self.f_step,
+            sequences     = [fstate, x_mask],
+            outputs_info  = init_val,
+            non_sequences = None,
+            n_steps       = nsteps
+        )
 
-        bstate_current, update = theano.scan(name          = 'LSTMBackwardEncoder',
-                                             fn            = self.b_step,
-                                             sequences     = [bstate, rx_mask],
-                                             outputs_info  = init_val,
-                                             non_sequences = None,
-                                             n_steps       = nsteps)
+        bstate_current, _ = theano.scan(
+            name          = 'LSTMBackwardEncoder',
+            fn            = self.b_step,
+            sequences     = [bstate, rx_mask],
+            outputs_info  = init_val,
+            non_sequences = None,
+            n_steps       = nsteps
+        )
 
         return fstate_current[0], bstate_current[0]
 
 
 class LSTMDecodeLayer(Core):
     def __init__(self, dim):
-        Core.__init__(self, ['W','U','V','C','b'])
+        Core.__init__(self, ['W', 'U', 'V', 'C', 'b'])
         self.dim = dim
-        self.tparams['W'] = get_4_ortho_weights(self.dim, name='W')
-        self.tparams['U'] = get_4_ortho_weights(self.dim, name='U')
-        self.tparams['V'] = get_4_ortho_weights(self.dim, name='V')
-        self.tparams['C'] = get_4_ortho_weights(self.dim, name='C')
-        self.tparams['b'] = get_zero_bias(4 * self.dim, name='b')
+        self.tparams['W'] = _get_4_ortho_weights(self.dim, name='W')
+        self.tparams['U'] = _get_4_ortho_weights(self.dim, name='U')
+        self.tparams['V'] = _get_4_ortho_weights(self.dim, name='V')
+        self.tparams['C'] = _get_4_ortho_weights(self.dim, name='C')
+        self.tparams['b'] = _get_zero_bias(4 * self.dim, name='b')
 
     def forward(self, state_below, emb_y_tm1, mask, h_tm1, c_tm1, context_vector):
         preact = (tensor.dot(state_below, self.tparams['W']) +
