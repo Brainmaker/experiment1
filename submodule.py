@@ -10,6 +10,7 @@ import theano.tensor as tensor
 from core import \
     dtype_cast, dropout, Dense, WordEmbeddingLayer, OutputLayer, BiLSTMEncodeLayer, LSTMDecodeLayer
 
+
 class SubModule(object):
     def __init__(self, layers_name):
         self.layers = OrderedDict().fromkeys(layers_name)
@@ -35,7 +36,7 @@ class SubModule(object):
 
 class Encoder(SubModule):
     def __init__(self, enc_dim, use_dropout):
-        SubModule.__init__(self, ['enc_1','enc_2','enc_3','enc_4'])
+        SubModule.__init__(self, ['enc_1', 'enc_2', 'enc_3', 'enc_4'])
         self.use_dropout = use_dropout
         self.enc_dim = enc_dim
         self.layers['enc_1'] = BiLSTMEncodeLayer(self.enc_dim)
@@ -44,8 +45,8 @@ class Encoder(SubModule):
         self.layers['enc_4'] = BiLSTMEncodeLayer(self.enc_dim)
 
     def encode(self, emb_x, x_mask):
-        emb_rx = emb_x
-        rx_mask = x_mask #TODO
+        emb_rx = emb_x[::-1]  # reverse
+        rx_mask = x_mask[::-1]
 
         if self.use_dropout:
             fh1, bh1 = self.layers['enc_1'].forward(emb_x, emb_rx, emb_x, emb_rx, x_mask, rx_mask)
@@ -62,7 +63,7 @@ class Encoder(SubModule):
 
 
 class WordEncoder(Encoder):
-    def __init__(self, enc_dim, vocab_size, use_dropout=True):
+    def __init__(self, enc_dim, vocab_size, use_dropout):
         Encoder.__init__(self, enc_dim, use_dropout)
         self.vocab_dim = vocab_size
         self.layers['word_embedding'] = WordEmbeddingLayer(enc_dim, vocab_size)
@@ -77,13 +78,13 @@ class WordEncoder(Encoder):
 
 
 class SentEncoder(Encoder):
-    def __init__(self, enc_dim, use_dropout=True):
+    def __init__(self, enc_dim, use_dropout):
         Encoder.__init__(self, enc_dim, use_dropout)
 
 
 class Decoder(SubModule):
     def __init__(self, dec_dim, use_dropout):
-        SubModule.__init__(self, ['dec_1','dec_2','dec_3','dec_4'])
+        SubModule.__init__(self, ['dec_1', 'dec_2', 'dec_3', 'dec_4'])
         self.use_dropout = use_dropout
         self.dec_dim = dec_dim
         self.layers['dec_1'] = LSTMDecodeLayer(self.dec_dim)
@@ -92,9 +93,9 @@ class Decoder(SubModule):
         self.layers['dec_4'] = LSTMDecodeLayer(self.dec_dim)
 
     def _get_init_state(self, batch_size):
-        return [tensor.alloc(dtype_cast(0.), batch_size, self.dec_dim) for i in range(9)]
+        return [tensor.alloc(dtype_cast(0.), batch_size, self.dec_dim) for i in range(10)]
 
-    def _step(self, mask, y_tm1, c1_tm1, c2_tm1, c3_tm1, c4_tm1, h1_tm1, h2_tm1, h3_tm1, h4_tm1,context_vector):
+    def _step(self, mask, y_tm1, _, c1_tm1, c2_tm1, c3_tm1, c4_tm1, h1_tm1, h2_tm1, h3_tm1, h4_tm1, context_vector):
 
         emb_y_tm1 = y_tm1
         if self.use_dropout:
@@ -110,7 +111,7 @@ class Decoder(SubModule):
             h4, c4 = self.layers['dec_4'].forward(h3, emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
 
         y = h4
-        return y, c1, c2, c3, c4, h1, h2, h3, h4
+        return y, _, c1, c2, c3, c4, h1, h2, h3, h4
 
     def decode(self, context_vector, target_seq_mask):
         batch_size = context_vector.shape[0]
@@ -122,7 +123,8 @@ class Decoder(SubModule):
             outputs_info  = init_state,
             non_sequences = context_vector,
         )
-        return rval[1]
+
+        return rval[0], rval[1]
 
 
 class WordDecoder(Decoder):
@@ -132,7 +134,13 @@ class WordDecoder(Decoder):
         self.layers['output_layer'] = OutputLayer(self.dec_dim, self.vocab_size)
         self.word_emb_layer = word_emb_layer
 
-    def _step(self, mask, y_tm1, c1_tm1, c2_tm1, c3_tm1, c4_tm1, h1_tm1, h2_tm1, h3_tm1, h4_tm1, context_vector):
+    def _get_init_state(self, batch_size):
+        init_state = [tensor.alloc(dtype_cast(0.), batch_size, self.vocab_size),
+                      tensor.alloc(dtype_cast(0.), batch_size, self.vocab_size)]
+        init_state += [tensor.alloc(dtype_cast(0.), batch_size, self.dec_dim) for i in range(8)]
+        return init_state
+
+    def _step(self, mask, y_tm1, _, c1_tm1, c2_tm1, c3_tm1, c4_tm1, h1_tm1, h2_tm1, h3_tm1, h4_tm1, context_vector):
 
         emb_y_tm1 = self.word_emb_layer.forward(y_tm1)
         if self.use_dropout:
@@ -140,16 +148,16 @@ class WordDecoder(Decoder):
             h2, c2 = self.layers['dec_2'].forward(dropout(h1), emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
             h3, c3 = self.layers['dec_3'].forward(dropout(h2), emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
             h4, c4 = self.layers['dec_4'].forward(dropout(h3), emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
-            y, y_idx = self.layers['output_layer'].forward(y_tm1, dropout(h4), context_vector)
+            y, prob_y = self.layers['output_layer'].forward(y_tm1, dropout(h4), context_vector)
 
         else:
             h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
             h2, c2 = self.layers['dec_2'].forward(h1, emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
             h3, c3 = self.layers['dec_3'].forward(h2, emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
             h4, c4 = self.layers['dec_4'].forward(h3, emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
-            y, y_idx = self.layers['output_layer'].forward(y_tm1, h4, context_vector)
+            y, prob_y = self.layers['output_layer'].forward(y_tm1, h4, context_vector)
 
-        return y, c1, c2, c3, c4, h1, h2, h3, h4
+        return y, prob_y, c1, c2, c3, c4, h1, h2, h3, h4
 
 
 class SentDecoder(Decoder):
