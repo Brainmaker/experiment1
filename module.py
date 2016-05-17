@@ -4,162 +4,228 @@
 import json
 from collections import OrderedDict
 
+import numpy
 import theano
 import theano.tensor as tensor
+from theano.sandbox.rng_mrg import MRG_RandomStreams
 
-from core import \
-    dtype_cast, dropout, Dense, WordEmbeddingLayer, OutputLayer, BiLSTMEncodeLayer, LSTMDecodeLayer
+EPS = 1e-6
+TRNG = MRG_RandomStreams(seed=888)
+DTYPE = theano.config.floatX
 
 
-class SubModule(object):
-    def __init__(self, layers_name):
-        self.layers = OrderedDict().fromkeys(layers_name)
+def dtype_cast(data):
+    return numpy.asarray(data, dtype=DTYPE)
+
+
+def dropout(state_before):
+    proj = tensor.switch(theano.shared(dtype_cast(0.)),
+                         state_before * TRNG.binomial(state_before.shape, p=0.5, n=1, dtype=state_before.dtype),
+                         state_before * 0.5)
+    return proj
+
+
+def _get_random_weights(dim1, dim2, name=None):
+    w = numpy.random.randn(dim1, dim2)
+    return theano.shared(w.astype(DTYPE), name=name)
+
+
+def _get_zero_bias(dim, name=None):
+    return theano.shared(numpy.zeros((dim,)).astype(DTYPE), name=name)
+
+
+def _get_4_ortho_weights(dim, name=None):
+    u, s, v = numpy.linalg.svd(numpy.random.randn(dim, dim))
+    ortho_weight = numpy.concatenate([u, u, u, u], axis=1)
+    return theano.shared(ortho_weight.astype(DTYPE), name=name)
+
+
+def _slice_4(x, slice_tag, dim):
+    if x.ndim == 3:
+        return x[:, :, slice_tag * dim: (slice_tag + 1) * dim]
+    return x[:, slice_tag * dim: (slice_tag + 1) * dim]
+
+
+class Core(object):
+    def __init__(self, name):
+        self.tparams = OrderedDict().fromkeys(name)
 
     def get_params(self):
-        module_params = []
-        for kk in self.layers.keys():
-            module_params.extend(self.layers[kk].get_params())
-        return module_params
+        return [p for p in self.tparams.values()]
 
-    def layers2json(self):
-        container = OrderedDict().fromkeys(self.layers.keys())
-        for name in self.layers.keys():
-            container[name] = self.layers[name].params2json()
-        return json.dumps(container)
+    def view_params(self):
+        return [p.get_value() for p in self.tparams.values()]
 
-    def json2layers(self, jsonstr):
-        container = json.loads(jsonstr)
-        assert container.keys() == self.layers.keys()
-        for name in container:
-            self.layers[name].json2params(container[name])
+    def params2json(self):
+        tparams = OrderedDict().fromkeys(self.tparams.keys())
+        for kk in tparams.keys():
+            tparams[kk] = self.tparams[kk].get_value().tolist()
+        return json.dumps(tparams)
 
-
-class Encoder(SubModule):
-    def __init__(self, enc_dim, use_dropout):
-        SubModule.__init__(self, ['enc_1', 'enc_2', 'enc_3', 'enc_4'])
-        self.use_dropout = use_dropout
-        self.enc_dim = enc_dim
-        self.layers['enc_1'] = BiLSTMEncodeLayer(self.enc_dim)
-        self.layers['enc_2'] = BiLSTMEncodeLayer(self.enc_dim)
-        self.layers['enc_3'] = BiLSTMEncodeLayer(self.enc_dim)
-        self.layers['enc_4'] = BiLSTMEncodeLayer(self.enc_dim)
-
-    def encode(self, emb_x, x_mask):
-        emb_rx = emb_x[::-1]  # reverse
-        rx_mask = x_mask[::-1]
-
-        if self.use_dropout:
-            fh1, bh1 = self.layers['enc_1'].forward(emb_x, emb_rx, emb_x, emb_rx, x_mask, rx_mask)
-            fh2, bh2 = self.layers['enc_2'].forward(emb_x, emb_rx, dropout(fh1), dropout(bh1), x_mask, rx_mask)
-            fh3, bh3 = self.layers['enc_3'].forward(emb_x, emb_rx, dropout(fh2), dropout(bh2), x_mask, rx_mask)
-            fh4, bh4 = self.layers['enc_4'].forward(emb_x, emb_rx, dropout(fh3), dropout(bh3), x_mask, rx_mask)
-        else:
-            fh1, bh1 = self.layers['enc_1'].forward(emb_x, emb_rx, emb_x, emb_rx, x_mask, rx_mask)
-            fh2, bh2 = self.layers['enc_2'].forward(emb_x, emb_rx, fh1, bh1, x_mask, rx_mask)
-            fh3, bh3 = self.layers['enc_3'].forward(emb_x, emb_rx, fh2, bh2, x_mask, rx_mask)
-            fh4, bh4 = self.layers['enc_4'].forward(emb_x, emb_rx, fh3, bh3, x_mask, rx_mask)
-
-        return tensor.concatenate([fh4[0], bh4[0]], axis=1)
+    def json2params(self, jsonstr):
+        tparams = json.loads(jsonstr)
+        assert tparams.keys() == self.tparams.keys()
+        for kk in tparams:
+            self.tparams[kk] = theano.shared(numpy.array(tparams[kk], dtype=DTYPE), name=kk)
 
 
-class WordEncoder(Encoder):
-    def __init__(self, enc_dim, vocab_size, use_dropout):
-        Encoder.__init__(self, enc_dim, use_dropout)
-        self.vocab_dim = vocab_size
-        self.layers['word_embedding'] = WordEmbeddingLayer(enc_dim, vocab_size)
+class Dense(Core):
+    def __init__(self, dim1, dim2):
+        Core.__init__(self, ['W', 'b'])
+        self.dim1 = dim1
+        self.dim2 = dim2
+        self.tparams['W'] = _get_random_weights(self.dim1, self.dim2, name='W')
+        self.tparams['b'] = _get_zero_bias(self.dim2, name='b')
 
-    def word_encode(self, x, x_mask):
-        if self.use_dropout:
-            _emb_x = self.layers['word_embedding'].forward(x)
-            emb_x = dropout(_emb_x)
-        else:
-            emb_x = self.layers['word_embedding'].forward(x)
-        return self.encode(emb_x, x_mask)
+    def forward(self, state_below):
+        return tensor.dot(state_below, self.tparams['W']) + self.tparams['b']
 
 
-class SentEncoder(Encoder):
-    def __init__(self, enc_dim, use_dropout):
-        Encoder.__init__(self, enc_dim, use_dropout)
+class WordEmbeddingLayer(Core):
+    def __init__(self, embedding_dim, vocab_size):
+        Core.__init__(self, ['E'])
+        self.embedding_dim = embedding_dim
+        self.vocab_size = vocab_size
+        self.tparams['E'] = _get_random_weights(vocab_size, embedding_dim, name='E')
+
+    def forward(self, one_hot_input):
+        return tensor.dot(one_hot_input, self.tparams['E'])
 
 
-class Decoder(SubModule):
-    def __init__(self, dec_dim, use_dropout):
-        SubModule.__init__(self, ['dec_1', 'dec_2', 'dec_3', 'dec_4'])
-        self.use_dropout = use_dropout
+class OutputLayer(Core):
+    def __init__(self, dec_dim, vocab_size):
+        Core.__init__(self, ['U0', 'E0', 'C0', 'W0'])
         self.dec_dim = dec_dim
-        self.layers['dec_1'] = LSTMDecodeLayer(self.dec_dim)
-        self.layers['dec_2'] = LSTMDecodeLayer(self.dec_dim)
-        self.layers['dec_3'] = LSTMDecodeLayer(self.dec_dim)
-        self.layers['dec_4'] = LSTMDecodeLayer(self.dec_dim)
+        self.vocab_size = vocab_size
+        self.tparams['U0'] = _get_random_weights(self.dec_dim, self.dec_dim, name='U0')
+        self.tparams['E0'] = _get_random_weights(self.vocab_size, self.dec_dim, name='E0')
+        self.tparams['C0'] = _get_random_weights(self.dec_dim, self.dec_dim, name='C0')
+        self.tparams['W0'] = _get_random_weights(self.dec_dim, self.vocab_size, name='W0')
 
-    def _get_init_state(self, batch_size):
-        return [tensor.alloc(dtype_cast(0.), batch_size, self.dec_dim) for i in range(10)]
+    def forward(self, y_tm1, h, context_vector):
+        t_bar = (tensor.dot(h, self.tparams['U0']) +
+                 tensor.dot(y_tm1, self.tparams['E0']) +
+                 tensor.dot(context_vector, self.tparams['C0']))
+        t = t_bar  # TODO: 2-maxout layer, the size of t_bar should be 2*dec_dim, here we use size(t_bar) = dec_dim
+        prob_y = tensor.nnet.softmax(tensor.dot(t, self.tparams['W0']))
+        y_idx = tensor.argmax(prob_y, axis=1)
+        y = theano.tensor.extra_ops.to_one_hot(y_idx, self.vocab_size, dtype=DTYPE)
+        return y, prob_y
 
-    def _step(self, mask, y_tm1, _, c1_tm1, c2_tm1, c3_tm1, c4_tm1, h1_tm1, h2_tm1, h3_tm1, h4_tm1, context_vector):
 
-        emb_y_tm1 = y_tm1
-        if self.use_dropout:
-            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
-            h2, c2 = self.layers['dec_2'].forward(dropout(h1), emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
-            h3, c3 = self.layers['dec_3'].forward(dropout(h2), emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
-            h4, c4 = self.layers['dec_4'].forward(dropout(h3), emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
+class BiLSTMEncodeLayer(Core):
+    def __init__(self, dim):
+        Core.__init__(self, ['f_W', 'f_U', 'f_V', 'f_b',
+                             'b_W', 'b_U', 'b_V', 'b_b'])
+        self.dim = dim
+        self.tparams['f_W'] = _get_4_ortho_weights(self.dim, name='f_W')
+        self.tparams['f_U'] = _get_4_ortho_weights(self.dim, name='f_U')
+        self.tparams['f_V'] = _get_4_ortho_weights(self.dim, name='f_V')
+        self.tparams['f_b'] = _get_zero_bias(4 * self.dim, name='f_b')
 
+        self.tparams['b_W'] = _get_4_ortho_weights(self.dim, name='b_W')
+        self.tparams['b_U'] = _get_4_ortho_weights(self.dim, name='b_U')
+        self.tparams['b_V'] = _get_4_ortho_weights(self.dim, name='b_V')
+        self.tparams['b_b'] = _get_zero_bias(4 * self.dim, name='b_b')
+
+    def f_step(self, x, mask, h_tm1, c_tm1):
+        preact = tensor.dot(h_tm1, self.tparams['f_U'])
+        preact += x
+
+        i = tensor.nnet.sigmoid(_slice_4(preact, 0, self.dim))
+        f = tensor.nnet.sigmoid(_slice_4(preact, 1, self.dim))
+        o = tensor.nnet.sigmoid(_slice_4(preact, 2, self.dim))
+        c = tensor.tanh(_slice_4(preact, 3, self.dim))
+
+        c = f * c_tm1 + i * c
+        c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
+
+        h = o * tensor.tanh(c)
+        h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
+
+        return h, c
+
+    def b_step(self, x, mask, h_tm1, c_tm1):
+        preact = tensor.dot(h_tm1, self.tparams['b_U'])
+        preact += x
+
+        i = tensor.nnet.sigmoid(_slice_4(preact, 0, self.dim))
+        f = tensor.nnet.sigmoid(_slice_4(preact, 1, self.dim))
+        o = tensor.nnet.sigmoid(_slice_4(preact, 2, self.dim))
+        c = tensor.tanh(_slice_4(preact, 3, self.dim))
+
+        c = f * c_tm1 + i * c
+        c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
+
+        h = o * tensor.tanh(c)
+        h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
+
+        return h, c
+
+    def forward(self, emb_x, emb_rx, fstate_below, bstate_below, x_mask, rx_mask):
+        nsteps = emb_x.shape[0]
+        if emb_x.ndim == 3:
+            n_samples = emb_x.shape[1]
         else:
-            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
-            h2, c2 = self.layers['dec_2'].forward(h1, emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
-            h3, c3 = self.layers['dec_3'].forward(h2, emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
-            h4, c4 = self.layers['dec_4'].forward(h3, emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
+            n_samples = 1
 
-        y = h4
-        return y, _, c1, c2, c3, c4, h1, h2, h3, h4
+        init_val = [tensor.alloc(dtype_cast(0.), n_samples, self.dim),
+                    tensor.alloc(dtype_cast(0.), n_samples, self.dim)]
 
-    def decode(self, context_vector, target_seq_mask):
-        batch_size = context_vector.shape[0]
-        init_state = self._get_init_state(batch_size)
-        rval, _ = theano.scan(
-            name          = 'Decoder',
-            fn            = self._step,
-            sequences     = target_seq_mask,
-            outputs_info  = init_state,
-            non_sequences = context_vector,
+        fstate = (tensor.dot(fstate_below, self.tparams['f_W']) +
+                  tensor.dot(emb_x, self.tparams['f_V']) +
+                  self.tparams['f_b'])
+
+        bstate = (tensor.dot(bstate_below, self.tparams['b_W']) +
+                  tensor.dot(emb_rx, self.tparams['b_V']) +
+                  self.tparams['b_b'])
+
+        fstate_current, _ = theano.scan(
+            name          = 'LSTMForwardEncoder',
+            fn            = self.f_step,
+            sequences     = [fstate, x_mask],
+            outputs_info  = init_val,
+            non_sequences = None,
+            n_steps       = nsteps
         )
 
-        return rval[0], rval[1]
+        bstate_current, _ = theano.scan(
+            name          = 'LSTMBackwardEncoder',
+            fn            = self.b_step,
+            sequences     = [bstate, rx_mask],
+            outputs_info  = init_val,
+            non_sequences = None,
+            n_steps       = nsteps
+        )
+
+        return fstate_current[0], bstate_current[0]
 
 
-class WordDecoder(Decoder):
-    def __init__(self, dec_dim, vocab_size, word_emb_layer, use_dropout):
-        Decoder.__init__(self, dec_dim, use_dropout)
-        self.vocab_size = vocab_size
-        self.layers['output_layer'] = OutputLayer(self.dec_dim, self.vocab_size)
-        self.word_emb_layer = word_emb_layer
+class LSTMDecodeLayer(Core):
+    def __init__(self, dim):
+        Core.__init__(self, ['W', 'U', 'V', 'C', 'b'])
+        self.dim = dim
+        self.tparams['W'] = _get_4_ortho_weights(self.dim, name='W')
+        self.tparams['U'] = _get_4_ortho_weights(self.dim, name='U')
+        self.tparams['V'] = _get_4_ortho_weights(self.dim, name='V')
+        self.tparams['C'] = _get_4_ortho_weights(self.dim, name='C')
+        self.tparams['b'] = _get_zero_bias(4 * self.dim, name='b')
 
-    def _get_init_state(self, batch_size):
-        init_state = [tensor.alloc(dtype_cast(0.), batch_size, self.vocab_size),
-                      tensor.alloc(dtype_cast(0.), batch_size, self.vocab_size)]
-        init_state += [tensor.alloc(dtype_cast(0.), batch_size, self.dec_dim) for i in range(8)]
-        return init_state
+    def forward(self, state_below, emb_y_tm1, mask, h_tm1, c_tm1, context_vector):
+        preact = (tensor.dot(state_below, self.tparams['W']) +
+                  tensor.dot(emb_y_tm1, self.tparams['V']) +
+                  tensor.dot(h_tm1, self.tparams['U']) +
+                  tensor.dot(context_vector, self.tparams['C']) +
+                  self.tparams['b'])
 
-    def _step(self, mask, y_tm1, _, c1_tm1, c2_tm1, c3_tm1, c4_tm1, h1_tm1, h2_tm1, h3_tm1, h4_tm1, context_vector):
+        i = tensor.nnet.sigmoid(_slice_4(preact, 0, self.dim))
+        f = tensor.nnet.sigmoid(_slice_4(preact, 1, self.dim))
+        o = tensor.nnet.sigmoid(_slice_4(preact, 2, self.dim))
+        c = tensor.tanh(_slice_4(preact, 3, self.dim))
 
-        emb_y_tm1 = self.word_emb_layer.forward(y_tm1)
-        if self.use_dropout:
-            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
-            h2, c2 = self.layers['dec_2'].forward(dropout(h1), emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
-            h3, c3 = self.layers['dec_3'].forward(dropout(h2), emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
-            h4, c4 = self.layers['dec_4'].forward(dropout(h3), emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
-            y, prob_y = self.layers['output_layer'].forward(y_tm1, dropout(h4), context_vector)
+        c = f * c_tm1 + i * c
+        c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
+        h = o * tensor.tanh(c)
+        h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
 
-        else:
-            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
-            h2, c2 = self.layers['dec_2'].forward(h1, emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
-            h3, c3 = self.layers['dec_3'].forward(h2, emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
-            h4, c4 = self.layers['dec_4'].forward(h3, emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
-            y, prob_y = self.layers['output_layer'].forward(y_tm1, h4, context_vector)
-
-        return y, prob_y, c1, c2, c3, c4, h1, h2, h3, h4
-
-
-class SentDecoder(Decoder):
-    def __init__(self, dec_dim, use_dropout):
-        Decoder.__init__(self, dec_dim, use_dropout)
+        return h, c
