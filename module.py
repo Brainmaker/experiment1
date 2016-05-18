@@ -4,228 +4,203 @@
 import json
 from collections import OrderedDict
 
-import numpy
 import theano
 import theano.tensor as tensor
-from theano.sandbox.rng_mrg import MRG_RandomStreams
+from theano.tensor.nnet import categorical_crossentropy
 
-EPS = 1e-6
-TRNG = MRG_RandomStreams(seed=888)
-DTYPE = theano.config.floatX
-
-
-def dtype_cast(data):
-    return numpy.asarray(data, dtype=DTYPE)
+from core import EPS, DTYPE
+from submodule import \
+    WordEncoder, SentEncoder, WordDecoder, SentDecoder
 
 
-def dropout(state_before):
-    proj = tensor.switch(theano.shared(dtype_cast(0.)),
-                         state_before * TRNG.binomial(state_before.shape, p=0.5, n=1, dtype=state_before.dtype),
-                         state_before * 0.5)
-    return proj
+class Module(object):
+    def __init__(self, submodule_name):
+        self.submodule = OrderedDict().fromkeys(submodule_name)
 
+    def save(self, filepath):
+        container = OrderedDict().fromkeys(self.submodule.keys())
+        for name in self.submodule.keys():
+            container[name] = self.submodule[name].layers2json()
+        module_json = json.dumps(container)
+        with open(filepath, 'w') as f:
+            f.write(module_json)
 
-def _get_random_weights(dim1, dim2, name=None):
-    w = numpy.random.randn(dim1, dim2)
-    return theano.shared(w.astype(DTYPE), name=name)
-
-
-def _get_zero_bias(dim, name=None):
-    return theano.shared(numpy.zeros((dim,)).astype(DTYPE), name=name)
-
-
-def _get_4_ortho_weights(dim, name=None):
-    u, s, v = numpy.linalg.svd(numpy.random.randn(dim, dim))
-    ortho_weight = numpy.concatenate([u, u, u, u], axis=1)
-    return theano.shared(ortho_weight.astype(DTYPE), name=name)
-
-
-def _slice_4(x, slice_tag, dim):
-    if x.ndim == 3:
-        return x[:, :, slice_tag * dim: (slice_tag + 1) * dim]
-    return x[:, slice_tag * dim: (slice_tag + 1) * dim]
-
-
-class Core(object):
-    def __init__(self, name):
-        self.tparams = OrderedDict().fromkeys(name)
+    def load(self, filepath):
+        with open(filepath, 'r') as f:
+            module_json = f.read()
+        container = json.loads(module_json)
+        assert container.keys() == self.submodule.keys()
+        for name in container.keys():
+            self.submodule[name].json2layers(container[name])
 
     def get_params(self):
-        return [p for p in self.tparams.values()]
+        module_params = []
+        for kk in self.submodule.keys():
+            module_params.extend(self.submodule[kk].get_params())
+        return module_params
 
-    def view_params(self):
-        return [p.get_value() for p in self.tparams.values()]
-
-    def params2json(self):
-        tparams = OrderedDict().fromkeys(self.tparams.keys())
-        for kk in tparams.keys():
-            tparams[kk] = self.tparams[kk].get_value().tolist()
-        return json.dumps(tparams)
-
-    def json2params(self, jsonstr):
-        tparams = json.loads(jsonstr)
-        assert tparams.keys() == self.tparams.keys()
-        for kk in tparams:
-            self.tparams[kk] = theano.shared(numpy.array(tparams[kk], dtype=DTYPE), name=kk)
+# 下面不加注释把我自己都绕晕了
 
 
-class Dense(Core):
-    def __init__(self, dim1, dim2):
-        Core.__init__(self, ['W', 'b'])
-        self.dim1 = dim1
-        self.dim2 = dim2
-        self.tparams['W'] = _get_random_weights(self.dim1, self.dim2, name='W')
-        self.tparams['b'] = _get_zero_bias(self.dim2, name='b')
+class SAE(Module):
+    """
+        SAE的输入:
+        x: 一个包含mini batch中所有句子的三维数组。每一列代表一个句子，每一行代表一个词。即一个timestep。
+           其大小为 max_timestep * batch_size * vocab_size
 
-    def forward(self, state_below):
-        return tensor.dot(state_below, self.tparams['W']) + self.tparams['b']
-
-
-class WordEmbeddingLayer(Core):
-    def __init__(self, embedding_dim, vocab_size):
-        Core.__init__(self, ['E'])
-        self.embedding_dim = embedding_dim
+        mask: 一个包含mini batch中所有句子mask的二维数组。每一列代表一个句子mask，每一行代表一个词mask。
+              其大小为 max_timestep * batch_size
+    """
+    def __init__(self, vocab_size, enc_dim, dec_dim, use_dropout):
+        Module.__init__(self, ['word_enc', 'word_dec'])
         self.vocab_size = vocab_size
-        self.tparams['E'] = _get_random_weights(vocab_size, embedding_dim, name='E')
-
-    def forward(self, one_hot_input):
-        return tensor.dot(one_hot_input, self.tparams['E'])
-
-
-class OutputLayer(Core):
-    def __init__(self, dec_dim, vocab_size):
-        Core.__init__(self, ['U0', 'E0', 'C0', 'W0'])
+        self.enc_dim = enc_dim
         self.dec_dim = dec_dim
-        self.vocab_size = vocab_size
-        self.tparams['U0'] = _get_random_weights(self.dec_dim, self.dec_dim, name='U0')
-        self.tparams['E0'] = _get_random_weights(self.vocab_size, self.dec_dim, name='E0')
-        self.tparams['C0'] = _get_random_weights(self.dec_dim, self.dec_dim, name='C0')
-        self.tparams['W0'] = _get_random_weights(self.dec_dim, self.vocab_size, name='W0')
+        self.use_dropout = use_dropout
 
-    def forward(self, y_tm1, h, context_vector):
-        t_bar = (tensor.dot(h, self.tparams['U0']) +
-                 tensor.dot(y_tm1, self.tparams['E0']) +
-                 tensor.dot(context_vector, self.tparams['C0']))
-        t = t_bar  # TODO: 2-maxout layer, the size of t_bar should be 2*dec_dim, here we use size(t_bar) = dec_dim
-        prob_y = tensor.nnet.softmax(tensor.dot(t, self.tparams['W0']))
-        y_idx = tensor.argmax(prob_y, axis=1)
-        y = theano.tensor.extra_ops.to_one_hot(y_idx, self.vocab_size, dtype=DTYPE)
-        return y, prob_y
+        self.submodule['word_enc'] = WordEncoder(self.enc_dim, self.vocab_size, use_dropout=use_dropout)
+        wemb_layer = self.submodule['word_enc'].layers['word_embedding']
+        self.submodule['word_dec'] = WordDecoder(self.dec_dim, self.vocab_size, wemb_layer, use_dropout=use_dropout)
 
+    @staticmethod
+    def _cost(target_seq, prob_pred_seq):
+        prob_pred_seq = tensor.clip(prob_pred_seq, EPS, 1.0 - EPS)
+        cce = categorical_crossentropy(coding_dist=prob_pred_seq, true_dist=target_seq) \
+            .mean(axis=0).mean(axis=0)
+        return cce
 
-class BiLSTMEncodeLayer(Core):
-    def __init__(self, dim):
-        Core.__init__(self, ['f_W', 'f_U', 'f_V', 'f_b',
-                             'b_W', 'b_U', 'b_V', 'b_b'])
-        self.dim = dim
-        self.tparams['f_W'] = _get_4_ortho_weights(self.dim, name='f_W')
-        self.tparams['f_U'] = _get_4_ortho_weights(self.dim, name='f_U')
-        self.tparams['f_V'] = _get_4_ortho_weights(self.dim, name='f_V')
-        self.tparams['f_b'] = _get_zero_bias(4 * self.dim, name='f_b')
+    def get_context_vector(self, x, mask):
+        s_emb = self.submodule['word_enc'].word_encode(x, mask)
+        context_vector = s_emb.T[0:3].T  # TODO: test 这里一定要注意！！！！！！加入更多的层后删掉！！
+        return context_vector
 
-        self.tparams['b_W'] = _get_4_ortho_weights(self.dim, name='b_W')
-        self.tparams['b_U'] = _get_4_ortho_weights(self.dim, name='b_U')
-        self.tparams['b_V'] = _get_4_ortho_weights(self.dim, name='b_V')
-        self.tparams['b_b'] = _get_zero_bias(4 * self.dim, name='b_b')
+    def decode(self, context_vector, mask):
+        pred_seq, prob_pred_seq = self.submodule['word_dec'].decode(context_vector, mask)
+        return pred_seq, prob_pred_seq
 
-    def f_step(self, x, mask, h_tm1, c_tm1):
-        preact = tensor.dot(h_tm1, self.tparams['f_U'])
-        preact += x
+    def forward(self, x, mask):
+        context_vector = self.get_context_vector(x, mask)
+        pred_seq, prob_pred_seq = self.decode(context_vector, mask)
+        return pred_seq, prob_pred_seq
 
-        i = tensor.nnet.sigmoid(_slice_4(preact, 0, self.dim))
-        f = tensor.nnet.sigmoid(_slice_4(preact, 1, self.dim))
-        o = tensor.nnet.sigmoid(_slice_4(preact, 2, self.dim))
-        c = tensor.tanh(_slice_4(preact, 3, self.dim))
+    def compile(self, optimizer):
+        input_sents = tensor.tensor3('input_sents', dtype=DTYPE)
+        target_sents = tensor.tensor3('target_sents', dtype=DTYPE)
+        mask = tensor.matrix('mask', dtype=DTYPE)
 
-        c = f * c_tm1 + i * c
-        c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
+        pred_sents, prob_pred_sents = self.forward(input_sents, mask)
+        cost = self._cost(target_sents, prob_pred_sents)
 
-        h = o * tensor.tanh(c)
-        h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
-
-        return h, c
-
-    def b_step(self, x, mask, h_tm1, c_tm1):
-        preact = tensor.dot(h_tm1, self.tparams['b_U'])
-        preact += x
-
-        i = tensor.nnet.sigmoid(_slice_4(preact, 0, self.dim))
-        f = tensor.nnet.sigmoid(_slice_4(preact, 1, self.dim))
-        o = tensor.nnet.sigmoid(_slice_4(preact, 2, self.dim))
-        c = tensor.tanh(_slice_4(preact, 3, self.dim))
-
-        c = f * c_tm1 + i * c
-        c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
-
-        h = o * tensor.tanh(c)
-        h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
-
-        return h, c
-
-    def forward(self, emb_x, emb_rx, fstate_below, bstate_below, x_mask, rx_mask):
-        nsteps = emb_x.shape[0]
-        if emb_x.ndim == 3:
-            n_samples = emb_x.shape[1]
-        else:
-            n_samples = 1
-
-        init_val = [tensor.alloc(dtype_cast(0.), n_samples, self.dim),
-                    tensor.alloc(dtype_cast(0.), n_samples, self.dim)]
-
-        fstate = (tensor.dot(fstate_below, self.tparams['f_W']) +
-                  tensor.dot(emb_x, self.tparams['f_V']) +
-                  self.tparams['f_b'])
-
-        bstate = (tensor.dot(bstate_below, self.tparams['b_W']) +
-                  tensor.dot(emb_rx, self.tparams['b_V']) +
-                  self.tparams['b_b'])
-
-        fstate_current, _ = theano.scan(
-            name          = 'LSTMForwardEncoder',
-            fn            = self.f_step,
-            sequences     = [fstate, x_mask],
-            outputs_info  = init_val,
-            non_sequences = None,
-            n_steps       = nsteps
+        f_updates = theano.function(
+            name='f_updates',
+            inputs=[input_sents, mask, target_sents],
+            outputs=[pred_sents, cost],
+            updates=optimizer(self.get_params(), cost)
         )
 
-        bstate_current, _ = theano.scan(
-            name          = 'LSTMBackwardEncoder',
-            fn            = self.b_step,
-            sequences     = [bstate, rx_mask],
-            outputs_info  = init_val,
-            non_sequences = None,
-            n_steps       = nsteps
+        return f_updates
+
+
+class DAE(Module):
+    """
+        DAE的输入:
+        x: 一个包含mini batch中所有文档的四维数组。对于前两个维而言，每一行代表一个timestep（即一个句子），每一列代表一个sample。
+           其大小为 max_doc_length * batch_size * max_sent_length * vocab_size
+
+        sent_mask: 大小为max_doc_length * batch_size * max_sent_length
+
+        doc_mask: 大小为max_doc_length * batch_size
+    """
+    def __init__(self, enc_dim, dec_dim, sae, use_dropout):
+        Module.__init__(self, ['sent_enc', 'sent_dec'])
+        self.enc_dim = enc_dim
+        self.dec_dim = dec_dim
+        self.use_dropout = use_dropout
+        self.sae = sae  # 在使用DAE前，必须先训练SAE
+        self.submodule['sent_enc'] = SentEncoder(self.enc_dim, use_dropout=use_dropout)
+        self.submodule['sent_dec'] = SentDecoder(self.dec_dim, use_dropout=use_dropout)
+
+    @staticmethod
+    def _cost(target_seq, prob_pred_seq):
+
+        prob_pred_seq = tensor.clip(prob_pred_seq, EPS, 1.0 - EPS)
+        cce = categorical_crossentropy(prob_pred_seq, target_seq).mean(axis=2).mean(axis=0).mean(axis=0)
+        return cce
+
+    def get_context_vector(self, x, sents_mask, doc_mask):
+
+        # x[i]大小为 batch_size * max_sent_length * vocab_size
+        # sent_mask[i]大小为 batch_size * max_sent_length
+        # 因此需要交换维度batch_size与max_sent_length
+        # max_doc_length = x.shape[0]
+        # s_cv_list = [self.sae.get_context_vector(x[i].dimshuffle(1, 0, 2), sents_mask[i].dimshuffle(1, 0))
+        #             for i in range(max_doc_length)]  # todo
+
+        # 对每个i, sae返回的每个context vector都是大小为 batchsize * enc_dim 的二维数组
+        # 接下来，用stack()将其合并。得到的三维数组大小为 max_doc_length * batchsize * enc_dim
+
+        # s_cv = tensor.stack(s_cv_list, axis=2).dimshuffle(2, 0, 1)
+
+        s_cv, _ = theano.scan(
+            name      = 'get_context_vector',
+            fn        = self.sae.get_context_vector,
+            sequences = [x.dimshuffle(0, 2, 1, 3), sents_mask.dimshuffle(0, 2, 1)],
+            n_steps   = x.shape[0]
         )
 
-        return fstate_current[0], bstate_current[0]
+        context_vector = self.submodule['sent_enc'].encode(s_cv, doc_mask)
+        return context_vector
 
+    def decode(self, context_vector, sents_mask, doc_mask):
+        s_cv, _ = self.submodule['sent_dec'].decode(context_vector, doc_mask)
 
-class LSTMDecodeLayer(Core):
-    def __init__(self, dim):
-        Core.__init__(self, ['W', 'U', 'V', 'C', 'b'])
-        self.dim = dim
-        self.tparams['W'] = _get_4_ortho_weights(self.dim, name='W')
-        self.tparams['U'] = _get_4_ortho_weights(self.dim, name='U')
-        self.tparams['V'] = _get_4_ortho_weights(self.dim, name='V')
-        self.tparams['C'] = _get_4_ortho_weights(self.dim, name='C')
-        self.tparams['b'] = _get_zero_bias(4 * self.dim, name='b')
+        # context_vector大小: batch_size * enc_dim
+        # s_cv大小: max_doc_length * batchsize * enc_dim
+        # sent_mask大小: max_doc_length * batch_size * max_sent_length
 
-    def forward(self, state_below, emb_y_tm1, mask, h_tm1, c_tm1, context_vector):
-        preact = (tensor.dot(state_below, self.tparams['W']) +
-                  tensor.dot(emb_y_tm1, self.tparams['V']) +
-                  tensor.dot(h_tm1, self.tparams['U']) +
-                  tensor.dot(context_vector, self.tparams['C']) +
-                  self.tparams['b'])
+        sents_mask = sents_mask.dimshuffle(0, 2, 1)
+        # prob_pred_seq_list = [self.sae.decode(s_cv[0], sents_mask[0]), self.sae.decode(s_cv[1], sents_mask[1])]
+        prob_pred_seq, _ = theano.scan(
+            fn        = self.sae.decode,
+            sequences = [s_cv, sents_mask],
+            n_steps   = doc_mask.shape[0]
+        )
 
-        i = tensor.nnet.sigmoid(_slice_4(preact, 0, self.dim))
-        f = tensor.nnet.sigmoid(_slice_4(preact, 1, self.dim))
-        o = tensor.nnet.sigmoid(_slice_4(preact, 2, self.dim))
-        c = tensor.tanh(_slice_4(preact, 3, self.dim))
+        # self.submodule['word_dec'].decode(s_cv[i], sents_mask[i])得到的内容为
+        #     pred_seq: max_sents_length * batchsize * vocab_size (one-hot vector)
+        #     pred_prob_seq: max_sents_length * batchsize * vocab_size (real value vector)
+        # 这里只取pred_prob_seq为列表内容，列表长度为max_doc_length
 
-        c = f * c_tm1 + i * c
-        c = mask[:, None] * c + (1. - mask)[:, None] * c_tm1
-        h = o * tensor.tanh(c)
-        h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
+        #prob_pred_seq = tensor.stack(prob_pred_seq_list[1], axis=3)
 
-        return h, c
+        # return s_cv.shape, sents_mask.dimshuffle(0, 2, 1).shape
+        return prob_pred_seq[0], prob_pred_seq[1]
+
+    def forward(self, x, sent_mask, doc_mask):
+        context_vector = self.get_context_vector(x, sent_mask, doc_mask).T[0:3].T
+        # TODO: test 上面这里一定要注意！！！！！！加入更多的层后删掉！！
+        # decode()返回的张量pred_seq, prob_pred_seq同尺寸，其大小为：
+        #   max_doc_length * max_sents_length * batch_size * vocab_size
+        # 使用dimshuffle交换axis后返回与target_seq对应的tensor
+        # 将来是否使用dimshuffle取决于train()的输入数据格式
+        pred_seq, prob_pred_seq = self.decode(context_vector, sent_mask, doc_mask)
+        # return pred_seq.dimshuffle(0, 2, 1, 3).shape, prob_pred_seq.dimshuffle(0, 2, 1, 3).shape
+        return pred_seq.dimshuffle(0, 2, 1, 3), prob_pred_seq.dimshuffle(0, 2, 1, 3)
+
+    def compile(self, optimizer):
+        input_docs = tensor.tensor4('input_docs', dtype=DTYPE)
+        target_docs = tensor.tensor4('target_docs', dtype=DTYPE)
+        sent_mask = tensor.tensor3('sent_mask', dtype=DTYPE)
+        doc_mask = tensor.matrix('doc_mask', dtype=DTYPE)
+
+        pred_docs, prob_pred_docs = self.forward(input_docs, sent_mask, doc_mask) #TODO
+        costf = self._cost(target_docs, prob_pred_docs)
+
+        f_update = theano.function(
+            name='f_d_updates',
+            inputs=[input_docs, sent_mask, doc_mask, target_docs],
+            outputs=[pred_docs, costf],
+            updates=optimizer(self.get_params(), costf)
+        )
+
+        return f_update
