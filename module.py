@@ -7,6 +7,7 @@ from collections import OrderedDict
 import theano
 import theano.tensor as tensor
 from theano.tensor.nnet import categorical_crossentropy
+from theano.tensor.extra_ops import to_one_hot
 
 from core import EPS, DTYPE
 from submodule import \
@@ -84,16 +85,26 @@ class SAE(Module):
         return pred_seq, prob_pred_seq
 
     def compile(self, optimizer):
-        input_sents = tensor.tensor3('input_sents', dtype=DTYPE)
-        target_sents = tensor.tensor3('target_sents', dtype=DTYPE)
+        x = tensor.imatrix('input_sents')
+
+        n_samples = x.shape[0]
+        max_sent_length = x.shape[1]
+
+        input_sents = to_one_hot(x.flatten(), self.vocab_size)
+        input_sents = tensor.reshape(input_sents, newshape=(n_samples, max_sent_length, self.vocab_size))
+        input_sents = input_sents.dimshuffle(1, 0, 2)
+
+        # input_sents = to_one_hot(x.flatten(), self.vocab_size).reshape(n_samples, max_sent_length, self.vocab_size)
+
+        target_sents = input_sents
         mask = tensor.matrix('mask', dtype=DTYPE)
 
         pred_sents, prob_pred_sents = self.forward(input_sents, mask)
         cost = self._cost(target_sents, prob_pred_sents)
 
         f_updates = theano.function(
-            name='f_updates',
-            inputs=[input_sents, mask, target_sents],
+            name='f_s_updates',
+            inputs=[x, mask],
             outputs=[pred_sents, cost],
             updates=optimizer(self.get_params(), cost)
         )
@@ -132,14 +143,8 @@ class DAE(Module):
         # x[i]大小为 batch_size * max_sent_length * vocab_size
         # sent_mask[i]大小为 batch_size * max_sent_length
         # 因此需要交换维度batch_size与max_sent_length
-        # max_doc_length = x.shape[0]
-        # s_cv_list = [self.sae.get_context_vector(x[i].dimshuffle(1, 0, 2), sents_mask[i].dimshuffle(1, 0))
-        #             for i in range(max_doc_length)]  # todo
-
-        # 对每个i, sae返回的每个context vector都是大小为 batchsize * enc_dim 的二维数组
+        # sae返回的每个context vector都是大小为 batchsize * enc_dim 的二维数组
         # 接下来，用stack()将其合并。得到的三维数组大小为 max_doc_length * batchsize * enc_dim
-
-        # s_cv = tensor.stack(s_cv_list, axis=2).dimshuffle(2, 0, 1)
 
         s_cv, _ = theano.scan(
             name      = 'get_context_vector',
@@ -188,19 +193,30 @@ class DAE(Module):
         return pred_seq.dimshuffle(0, 2, 1, 3), prob_pred_seq.dimshuffle(0, 2, 1, 3)
 
     def compile(self, optimizer):
-        input_docs = tensor.tensor4('input_docs', dtype=DTYPE)
-        target_docs = tensor.tensor4('target_docs', dtype=DTYPE)
+        x = tensor.itensor3('x')
+
+        n_samples = x.shape[0]
+        max_doc_length = x.shape[1]
+        max_sent_length = x.shape[2]
+        vocab_size = self.sae.vocab_size
+
+        input_docs = to_one_hot(x.flatten(), vocab_size)
+        input_docs = tensor.reshape(input_docs, newshape=(n_samples, max_doc_length, max_sent_length, vocab_size))
+        input_docs = input_docs.dimshuffle(1, 0, 2, 3)
+
+        target_docs = input_docs
         sent_mask = tensor.tensor3('sent_mask', dtype=DTYPE)
         doc_mask = tensor.matrix('doc_mask', dtype=DTYPE)
 
-        pred_docs, prob_pred_docs = self.forward(input_docs, sent_mask, doc_mask) #TODO
+        pred_docs, prob_pred_docs = self.forward(input_docs, sent_mask, doc_mask)  # TODO
         costf = self._cost(target_docs, prob_pred_docs)
 
-        f_update = theano.function(
+        f_updates = theano.function(
             name='f_d_updates',
-            inputs=[input_docs, sent_mask, doc_mask, target_docs],
+            inputs=[x, sent_mask, doc_mask],
             outputs=[pred_docs, costf],
             updates=optimizer(self.get_params(), costf)
         )
 
-        return f_update
+        return f_updates
+        
