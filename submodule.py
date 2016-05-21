@@ -6,204 +6,160 @@ from collections import OrderedDict
 
 import theano
 import theano.tensor as tensor
-from theano.tensor.nnet import categorical_crossentropy
-from theano.tensor.extra_ops import to_one_hot
 
-from core import EPS, DTYPE, IDX_TYPE
-from submodule import \
-    WordEncoder, SentEncoder, WordDecoder, SentDecoder
+from core import \
+    dtype_cast, dropout, Dense, WordEmbeddingLayer, OutputLayer, BiLSTMEncodeLayer, LSTMDecodeLayer
 
 
-class Module(object):
-    def __init__(self, submodule_name):
-        self.submodule = OrderedDict().fromkeys(submodule_name)
-
-    def save(self, filepath):
-        container = OrderedDict().fromkeys(self.submodule.keys())
-        for name in self.submodule.keys():
-            container[name] = self.submodule[name].layers2json()
-        module_json = json.dumps(container)
-        with open(filepath, 'w') as f:
-            f.write(module_json)
-
-    def load(self, filepath):
-        with open(filepath, 'r') as f:
-            module_json = f.read()
-        container = json.loads(module_json)
-        assert container.keys() == self.submodule.keys()
-        for name in container.keys():
-            self.submodule[name].json2layers(container[name])
+class SubModule(object):
+    def __init__(self, layers_name):
+        self.layers = OrderedDict().fromkeys(layers_name)
 
     def get_params(self):
         module_params = []
-        for kk in self.submodule.keys():
-            module_params.extend(self.submodule[kk].get_params())
+        for kk in self.layers.keys():
+            module_params.extend(self.layers[kk].get_params())
         return module_params
 
-# 下面不加注释把我自己都绕晕了
+    def layers2json(self):
+        container = OrderedDict().fromkeys(self.layers.keys())
+        for name in self.layers.keys():
+            container[name] = self.layers[name].params2json()
+        return json.dumps(container)
+
+    def json2layers(self, jsonstr):
+        container = json.loads(jsonstr)
+        assert container.keys() == self.layers.keys()
+        for name in container:
+            self.layers[name].json2params(container[name])
 
 
-class SAE(Module):
-    """
-        SAE的输入:
-        x: 一个包含mini batch中所有句子的三维数组。每一列代表一个句子，每一行代表一个词。即一个timestep。
-           其大小为 max_timestep * batch_size * vocab_size
+class Encoder(SubModule):
+    def __init__(self, enc_dim, use_dropout):
+        SubModule.__init__(self, ['enc_1', 'enc_2', 'enc_3', 'enc_4'])
+        self.use_dropout = use_dropout
+        self.enc_dim = enc_dim
+        self.layers['enc_1'] = BiLSTMEncodeLayer(self.enc_dim)
+        self.layers['enc_2'] = BiLSTMEncodeLayer(self.enc_dim)
+        self.layers['enc_3'] = BiLSTMEncodeLayer(self.enc_dim)
+        self.layers['enc_4'] = BiLSTMEncodeLayer(self.enc_dim)
 
-        mask: 一个包含mini batch中所有句子mask的二维数组。每一列代表一个句子mask，每一行代表一个词mask。
-              其大小为 max_timestep * batch_size
-    """
-    def __init__(self, vocab_size, enc_dim, dec_dim, use_dropout):
-        Module.__init__(self, ['word_enc', 'word_dec'])
+    def encode(self, emb_x, x_mask):
+        emb_rx = emb_x[::-1]  # reverse
+        rx_mask = x_mask[::-1]
+
+        if self.use_dropout:
+            fh1, bh1 = self.layers['enc_1'].forward(emb_x, emb_rx, emb_x, emb_rx, x_mask, rx_mask)
+            fh2, bh2 = self.layers['enc_2'].forward(emb_x, emb_rx, dropout(fh1), dropout(bh1), x_mask, rx_mask)
+            fh3, bh3 = self.layers['enc_3'].forward(emb_x, emb_rx, dropout(fh2), dropout(bh2), x_mask, rx_mask)
+            fh4, bh4 = self.layers['enc_4'].forward(emb_x, emb_rx, dropout(fh3), dropout(bh3), x_mask, rx_mask)
+        else:
+            fh1, bh1 = self.layers['enc_1'].forward(emb_x, emb_rx, emb_x, emb_rx, x_mask, rx_mask)
+            fh2, bh2 = self.layers['enc_2'].forward(emb_x, emb_rx, fh1, bh1, x_mask, rx_mask)
+            fh3, bh3 = self.layers['enc_3'].forward(emb_x, emb_rx, fh2, bh2, x_mask, rx_mask)
+            fh4, bh4 = self.layers['enc_4'].forward(emb_x, emb_rx, fh3, bh3, x_mask, rx_mask)
+
+        return tensor.concatenate([fh4[0], bh4[0]], axis=1)
+
+
+class WordEncoder(Encoder):
+    def __init__(self, enc_dim, vocab_size, use_dropout):
+        Encoder.__init__(self, enc_dim, use_dropout)
+        self.vocab_dim = vocab_size
+        self.layers['word_embedding'] = WordEmbeddingLayer(enc_dim, vocab_size)
+
+    def word_encode(self, x, x_mask):
+        if self.use_dropout:
+            _emb_x = self.layers['word_embedding'].forward(x)
+            emb_x = dropout(_emb_x)
+        else:
+            emb_x = self.layers['word_embedding'].forward(x)
+        return self.encode(emb_x, x_mask)
+
+
+class SentEncoder(Encoder):
+    def __init__(self, enc_dim, use_dropout):
+        Encoder.__init__(self, enc_dim, use_dropout)
+
+
+class Decoder(SubModule):
+    def __init__(self, dec_dim, use_dropout):
+        SubModule.__init__(self, ['dec_1', 'dec_2', 'dec_3', 'dec_4'])
+        self.use_dropout = use_dropout
+        self.dec_dim = dec_dim
+        self.layers['dec_1'] = LSTMDecodeLayer(self.dec_dim)
+        self.layers['dec_2'] = LSTMDecodeLayer(self.dec_dim)
+        self.layers['dec_3'] = LSTMDecodeLayer(self.dec_dim)
+        self.layers['dec_4'] = LSTMDecodeLayer(self.dec_dim)
+
+    def _get_init_state(self, batch_size):
+        return [tensor.alloc(dtype_cast(0.), batch_size, self.dec_dim) for i in range(10)]
+
+    def _step(self, mask, y_tm1, _, c1_tm1, c2_tm1, c3_tm1, c4_tm1, h1_tm1, h2_tm1, h3_tm1, h4_tm1, context_vector):
+
+        emb_y_tm1 = y_tm1
+        if self.use_dropout:
+            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+            h2, c2 = self.layers['dec_2'].forward(dropout(h1), emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
+            h3, c3 = self.layers['dec_3'].forward(dropout(h2), emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
+            h4, c4 = self.layers['dec_4'].forward(dropout(h3), emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
+
+        else:
+            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+            h2, c2 = self.layers['dec_2'].forward(h1, emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
+            h3, c3 = self.layers['dec_3'].forward(h2, emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
+            h4, c4 = self.layers['dec_4'].forward(h3, emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
+
+        y = h4
+        return y, _, c1, c2, c3, c4, h1, h2, h3, h4
+
+    def decode(self, context_vector, target_seq_mask):
+        batch_size = context_vector.shape[0]
+        init_state = self._get_init_state(batch_size)
+        rval, _ = theano.scan(
+            name          = 'Decoder',
+            fn            = self._step,
+            sequences     = target_seq_mask,
+            outputs_info  = init_state,
+            non_sequences = context_vector,
+        )
+
+        return rval[0], rval[1]
+
+
+class WordDecoder(Decoder):
+    def __init__(self, dec_dim, vocab_size, word_emb_layer, use_dropout):
+        Decoder.__init__(self, dec_dim, use_dropout)
         self.vocab_size = vocab_size
-        self.enc_dim = enc_dim
-        self.dec_dim = dec_dim
-        self.use_dropout = use_dropout
+        self.layers['output_layer'] = OutputLayer(self.dec_dim, self.vocab_size)
+        self.word_emb_layer = word_emb_layer
 
-        self.submodule['word_enc'] = WordEncoder(self.enc_dim, self.vocab_size, use_dropout=use_dropout)
-        wemb_layer = self.submodule['word_enc'].layers['word_embedding']
-        self.submodule['word_dec'] = WordDecoder(self.dec_dim, self.vocab_size, wemb_layer, use_dropout=use_dropout)
+    def _get_init_state(self, batch_size):
+        init_state = [tensor.alloc(dtype_cast(0.), batch_size, self.vocab_size),
+                      tensor.alloc(dtype_cast(0.), batch_size, self.vocab_size)]
+        init_state += [tensor.alloc(dtype_cast(0.), batch_size, self.dec_dim) for i in range(8)]
+        return init_state
 
-    @staticmethod
-    def _cost(target_seq, prob_pred_seq):
-        prob_pred_seq = tensor.clip(prob_pred_seq, EPS, 1.0 - EPS)
-        cce = categorical_crossentropy(coding_dist=prob_pred_seq, true_dist=target_seq) \
-            .mean(axis=0).mean(axis=0)
-        return cce
+    def _step(self, mask, y_tm1, _, c1_tm1, c2_tm1, c3_tm1, c4_tm1, h1_tm1, h2_tm1, h3_tm1, h4_tm1, context_vector):
 
-    def get_context_vector(self, x, mask):
-        s_emb = self.submodule['word_enc'].word_encode(x, mask)
-        context_vector = s_emb.T[0:3].T  # TODO: test 这里一定要注意！！！！！！加入更多的层后删掉！！
-        return context_vector
+        emb_y_tm1 = self.word_emb_layer.forward(y_tm1)
+        if self.use_dropout:
+            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+            h2, c2 = self.layers['dec_2'].forward(dropout(h1), emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
+            h3, c3 = self.layers['dec_3'].forward(dropout(h2), emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
+            h4, c4 = self.layers['dec_4'].forward(dropout(h3), emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
+            y, prob_y = self.layers['output_layer'].forward(y_tm1, dropout(h4), context_vector)
 
-    def decode(self, context_vector, mask):
-        pred_seq, prob_pred_seq = self.submodule['word_dec'].decode(context_vector, mask)
-        return pred_seq, prob_pred_seq
+        else:
+            h1, c1 = self.layers['dec_1'].forward(emb_y_tm1, emb_y_tm1, mask, h1_tm1, c1_tm1, context_vector)
+            h2, c2 = self.layers['dec_2'].forward(h1, emb_y_tm1, mask, h2_tm1, c2_tm1, context_vector)
+            h3, c3 = self.layers['dec_3'].forward(h2, emb_y_tm1, mask, h3_tm1, c3_tm1, context_vector)
+            h4, c4 = self.layers['dec_4'].forward(h3, emb_y_tm1, mask, h4_tm1, c4_tm1, context_vector)
+            y, prob_y = self.layers['output_layer'].forward(y_tm1, h4, context_vector)
 
-    def forward(self, x, mask):
-        context_vector = self.get_context_vector(x, mask)
-        pred_seq, prob_pred_seq = self.decode(context_vector, mask)
-        return pred_seq, prob_pred_seq
-
-    def compile(self, optimizer):
-        """
-        input_sents: max_sents_length * batch_size * vocab_size
-        """
-        input_sents = tensor.tensor3('name', dtype=DTYPE)
-        target_sents = input_sents
-        mask = tensor.matrix('mask', dtype=DTYPE)
-
-        pred_sents, prob_pred_sents = self.forward(input_sents, mask)
-        cost = self._cost(target_sents, prob_pred_sents)
-
-        f_updates = theano.function(
-            name='f_s_updates',
-            inputs=[input_sents, mask],
-            outputs=[pred_sents, cost],
-            updates=optimizer(self.get_params(), cost)
-        )
-
-        return f_updates
+        return y, prob_y, c1, c2, c3, c4, h1, h2, h3, h4
 
 
-class DAE(Module):
-    """
-        DAE的输入:
-        x: 一个包含mini batch中所有文档的四维数组。对于前两个维而言，每一行代表一个timestep（即一个句子），每一列代表一个sample。
-           其大小为 max_doc_length * batch_size * max_sent_length * vocab_size
-
-        sent_mask: 大小为max_doc_length * batch_size * max_sent_length
-
-        doc_mask: 大小为max_doc_length * batch_size
-    """
-    def __init__(self, enc_dim, dec_dim, sae, use_dropout):
-        Module.__init__(self, ['sent_enc', 'sent_dec'])
-        self.enc_dim = enc_dim
-        self.dec_dim = dec_dim
-        self.use_dropout = use_dropout
-        self.sae = sae  # 在使用DAE前，必须先训练SAE
-        self.submodule['sent_enc'] = SentEncoder(self.enc_dim, use_dropout=use_dropout)
-        self.submodule['sent_dec'] = SentDecoder(self.dec_dim, use_dropout=use_dropout)
-
-    @staticmethod
-    def _cost(target_seq, prob_pred_seq):
-
-        prob_pred_seq = tensor.clip(prob_pred_seq, EPS, 1.0 - EPS)
-        cce = categorical_crossentropy(prob_pred_seq, target_seq).mean(axis=2).mean(axis=0).mean(axis=0)
-        return cce
-
-    def get_context_vector(self, x, sents_mask, doc_mask):
-
-        # x[i]大小为 batch_size * max_sent_length * vocab_size
-        # sent_mask[i]大小为 batch_size * max_sent_length
-        # 因此需要交换维度batch_size与max_sent_length
-        # sae返回的每个context vector都是大小为 batchsize * enc_dim 的二维数组
-        # 接下来，用stack()将其合并。得到的三维数组大小为 max_doc_length * batchsize * enc_dim
-
-        s_cv, _ = theano.scan(
-            name      = 'get_context_vector',
-            fn        = self.sae.get_context_vector,
-            sequences = [x.dimshuffle(0, 2, 1, 3), sents_mask.dimshuffle(0, 2, 1)],
-            n_steps   = x.shape[0]
-        )
-
-        context_vector = self.submodule['sent_enc'].encode(s_cv, doc_mask)
-        return context_vector
-
-    def decode(self, context_vector, sents_mask, doc_mask):
-        s_cv, _ = self.submodule['sent_dec'].decode(context_vector, doc_mask)
-
-        # context_vector大小: batch_size * enc_dim
-        # s_cv大小: max_doc_length * batchsize * enc_dim
-        # sent_mask大小: max_doc_length * batch_size * max_sent_length
-
-        sents_mask = sents_mask.dimshuffle(0, 2, 1)
-        # prob_pred_seq_list = [self.sae.decode(s_cv[0], sents_mask[0]), self.sae.decode(s_cv[1], sents_mask[1])]
-        prob_pred_seq, _ = theano.scan(
-            fn        = self.sae.decode,
-            sequences = [s_cv, sents_mask],
-            n_steps   = doc_mask.shape[0]
-        )
-
-        # self.submodule['word_dec'].decode(s_cv[i], sents_mask[i])得到的内容为
-        #     pred_seq: max_sents_length * batchsize * vocab_size (one-hot vector)
-        #     pred_prob_seq: max_sents_length * batchsize * vocab_size (real value vector)
-        # 这里只取pred_prob_seq为列表内容，列表长度为max_doc_length
-
-        #prob_pred_seq = tensor.stack(prob_pred_seq_list[1], axis=3)
-
-        # return s_cv.shape, sents_mask.dimshuffle(0, 2, 1).shape
-        return prob_pred_seq[0], prob_pred_seq[1]
-
-    def forward(self, x, sent_mask, doc_mask):
-        context_vector = self.get_context_vector(x, sent_mask, doc_mask).T[0:3].T
-        # TODO: test 上面这里一定要注意！！！！！！加入更多的层后删掉！！
-        # decode()返回的张量pred_seq, prob_pred_seq同尺寸，其大小为：
-        #   max_doc_length * max_sents_length * batch_size * vocab_size
-        # 使用dimshuffle交换axis后返回与target_seq对应的tensor
-        # 将来是否使用dimshuffle取决于train()的输入数据格式
-        pred_seq, prob_pred_seq = self.decode(context_vector, sent_mask, doc_mask)
-        # return pred_seq.dimshuffle(0, 2, 1, 3).shape, prob_pred_seq.dimshuffle(0, 2, 1, 3).shape
-        return pred_seq.dimshuffle(0, 2, 1, 3), prob_pred_seq.dimshuffle(0, 2, 1, 3)
-
-    def compile(self, optimizer):
-        """
-        input_docs: max_doc_length * batch_size * max_sents_length * vocab_size
-        """
-        input_docs = tensor.tensor4('input_docs', dtype=DTYPE)
-
-        target_docs = input_docs
-        sent_mask = tensor.tensor3('sent_mask', dtype=DTYPE)
-        doc_mask = tensor.matrix('doc_mask', dtype=DTYPE)
-
-        pred_docs, prob_pred_docs = self.forward(input_docs, sent_mask, doc_mask)  # TODO
-        costf = self._cost(target_docs, prob_pred_docs)
-
-        f_updates = theano.function(
-            name='f_d_updates',
-            inputs=[input_docs, sent_mask, doc_mask],
-            outputs=[pred_docs, costf],
-            updates=optimizer(self.get_params(), costf)
-        )
-
-        return f_updates
-        
+class SentDecoder(Decoder):
+    def __init__(self, dec_dim, use_dropout):
+        Decoder.__init__(self, dec_dim, use_dropout)
