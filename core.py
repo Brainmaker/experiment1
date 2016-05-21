@@ -12,10 +12,15 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams
 EPS = 1e-6
 TRNG = MRG_RandomStreams(seed=888)
 DTYPE = theano.config.floatX
+IDX_TYPE = 'int64'
 
 
 def dtype_cast(data):
     return numpy.asarray(data, dtype=DTYPE)
+
+
+def unzip2list(zipped):
+    pass
 
 
 def dropout(state_before):
@@ -52,6 +57,9 @@ class Core(object):
 
     def get_params(self):
         return [p for p in self.tparams.values()]
+
+    def view_params(self):
+        return [p.get_value() for p in self.tparams.values()]
 
     def params2json(self):
         tparams = OrderedDict().fromkeys(self.tparams.keys())
