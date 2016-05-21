@@ -234,3 +234,5 @@ class LSTMDecodeLayer(Core):
         h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
 
         return h, c
+        
+        
