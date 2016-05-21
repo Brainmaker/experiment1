@@ -9,7 +9,7 @@ import theano.tensor as tensor
 from theano.tensor.nnet import categorical_crossentropy
 from theano.tensor.extra_ops import to_one_hot
 
-from core import EPS, DTYPE
+from core import EPS, DTYPE, IDX_TYPE
 from submodule import \
     WordEncoder, SentEncoder, WordDecoder, SentDecoder
 
@@ -85,17 +85,10 @@ class SAE(Module):
         return pred_seq, prob_pred_seq
 
     def compile(self, optimizer):
-        x = tensor.imatrix('input_sents')
-
-        n_samples = x.shape[0]
-        max_sent_length = x.shape[1]
-
-        input_sents = to_one_hot(x.flatten(), self.vocab_size)
-        input_sents = tensor.reshape(input_sents, newshape=(n_samples, max_sent_length, self.vocab_size))
-        input_sents = input_sents.dimshuffle(1, 0, 2)
-
-        # input_sents = to_one_hot(x.flatten(), self.vocab_size).reshape(n_samples, max_sent_length, self.vocab_size)
-
+        """
+        input_sents: max_sents_length * batch_size * vocab_size
+        """
+        input_sents = tensor.tensor3('name', dtype=DTYPE)
         target_sents = input_sents
         mask = tensor.matrix('mask', dtype=DTYPE)
 
@@ -104,7 +97,7 @@ class SAE(Module):
 
         f_updates = theano.function(
             name='f_s_updates',
-            inputs=[x, mask],
+            inputs=[input_sents, mask],
             outputs=[pred_sents, cost],
             updates=optimizer(self.get_params(), cost)
         )
@@ -193,16 +186,10 @@ class DAE(Module):
         return pred_seq.dimshuffle(0, 2, 1, 3), prob_pred_seq.dimshuffle(0, 2, 1, 3)
 
     def compile(self, optimizer):
-        x = tensor.itensor3('x')
-
-        n_samples = x.shape[0]
-        max_doc_length = x.shape[1]
-        max_sent_length = x.shape[2]
-        vocab_size = self.sae.vocab_size
-
-        input_docs = to_one_hot(x.flatten(), vocab_size)
-        input_docs = tensor.reshape(input_docs, newshape=(n_samples, max_doc_length, max_sent_length, vocab_size))
-        input_docs = input_docs.dimshuffle(1, 0, 2, 3)
+        """
+        input_docs: max_doc_length * batch_size * max_sents_length * vocab_size
+        """
+        input_docs = tensor.tensor4('input_docs', dtype=DTYPE)
 
         target_docs = input_docs
         sent_mask = tensor.tensor3('sent_mask', dtype=DTYPE)
@@ -213,7 +200,7 @@ class DAE(Module):
 
         f_updates = theano.function(
             name='f_d_updates',
-            inputs=[x, sent_mask, doc_mask],
+            inputs=[input_docs, sent_mask, doc_mask],
             outputs=[pred_docs, costf],
             updates=optimizer(self.get_params(), costf)
         )
