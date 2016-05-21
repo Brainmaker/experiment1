@@ -235,4 +235,3 @@ class LSTMDecodeLayer(Core):
 
         return h, c
         
-        
