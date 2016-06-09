@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 # -*- coding: utf-8 -*-
 
 import json
@@ -7,11 +7,10 @@ from collections import OrderedDict
 import theano
 import theano.tensor as tensor
 from theano.tensor.nnet import categorical_crossentropy
-from theano.tensor.extra_ops import to_one_hot
 
 from core import EPS, DTYPE, IDX_TYPE
 from submodule import \
-    WordEncoder, SentEncoder, WordDecoder, SentDecoder
+    WordEncoder, SentEncoder, WordDecoder, SentDecoder, MLP
 
 
 class Module(object):
@@ -53,7 +52,8 @@ class SAE(Module):
               其大小为 max_timestep * batch_size
     """
     def __init__(self, vocab_size, enc_dim, dec_dim, use_dropout):
-        Module.__init__(self, ['word_enc', 'word_dec'])
+        #Module.__init__(self, ['word_enc', 'word_dec', 'mlp'])
+        Module.__init__(self, ['word_enc', 'word_dec', 'mlp'])
         self.vocab_size = vocab_size
         self.enc_dim = enc_dim
         self.dec_dim = dec_dim
@@ -62,6 +62,7 @@ class SAE(Module):
         self.submodule['word_enc'] = WordEncoder(self.enc_dim, self.vocab_size, use_dropout=use_dropout)
         wemb_layer = self.submodule['word_enc'].layers['word_embedding']
         self.submodule['word_dec'] = WordDecoder(self.dec_dim, self.vocab_size, wemb_layer, use_dropout=use_dropout)
+        self.submodule['mlp'] = MLP(self.enc_dim * 2, self.dec_dim, use_dropout=False)
 
     @staticmethod
     def _cost(target_seq, prob_pred_seq):
@@ -72,7 +73,7 @@ class SAE(Module):
 
     def get_context_vector(self, x, mask):
         s_emb = self.submodule['word_enc'].word_encode(x, mask)
-        context_vector = s_emb.T[0:3].T  # TODO: test 这里一定要注意！！！！！！加入更多的层后删掉！！
+        context_vector = self.submodule['mlp'].forward(s_emb)
         return context_vector
 
     def decode(self, context_vector, mask):
@@ -96,10 +97,10 @@ class SAE(Module):
         cost = self._cost(target_sents, prob_pred_sents)
 
         f_updates = theano.function(
-            name='f_s_updates',
-            inputs=[input_sents, mask],
-            outputs=[pred_sents, cost],
-            updates=optimizer(self.get_params(), cost)
+            name    = 'f_s_updates',
+            inputs  = [input_sents, mask],
+            outputs = [pred_sents, cost],
+            updates = optimizer(self.get_params(), cost)
         )
 
         return f_updates
@@ -206,4 +207,3 @@ class DAE(Module):
         )
 
         return f_updates
-        
