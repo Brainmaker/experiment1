@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 # -*- coding: utf-8 -*-
 
 import json
@@ -45,8 +45,8 @@ class Encoder(SubModule):
         self.layers['enc_4'] = BiLSTMEncodeLayer(self.enc_dim)
 
     def encode(self, emb_x, x_mask):
-        emb_rx = emb_x[::-1]  # reverse
-        rx_mask = x_mask[::-1]
+        emb_rx = emb_x[:, ::-1]  # reverse
+        rx_mask = x_mask[:, ::-1]
 
         if self.use_dropout:
             fh1, bh1 = self.layers['enc_1'].forward(emb_x, emb_rx, emb_x, emb_rx, x_mask, rx_mask)
@@ -163,3 +163,28 @@ class WordDecoder(Decoder):
 class SentDecoder(Decoder):
     def __init__(self, dec_dim, use_dropout):
         Decoder.__init__(self, dec_dim, use_dropout)
+
+
+class MLP(SubModule):
+    def __init__(self, input_dim, output_dim, use_dropout):
+        SubModule.__init__(self, ['layer_1', 'layer_2', 'layer_3'])
+        self.use_dropout = use_dropout
+        assert output_dim * 2 == input_dim
+        mid_dim_1 = int(1.67 * output_dim)
+        mid_dim_2 = int(1.33 * output_dim)
+
+        self.layers['layer_1'] = Dense(input_dim, mid_dim_1)
+        self.layers['layer_2'] = Dense(mid_dim_1, mid_dim_2)
+        self.layers['layer_3'] = Dense(mid_dim_2, output_dim)
+
+    def forward(self, x):
+        if self.use_dropout:
+            h1 = self.layers['layer_1'].forward(dropout(x))
+            h2 = self.layers['layer_2'].forward(dropout(h1))
+            h3 = self.layers['layer_3'].forward(dropout(h2))
+        else:
+            h1 = self.layers['layer_1'].forward(x)
+            h2 = self.layers['layer_2'].forward(h1)
+            h3 = self.layers['layer_3'].forward(h2)
+
+        return h3
