@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 # -*- coding: utf-8 -*-
 
 import json
@@ -9,8 +9,10 @@ import theano
 import theano.tensor as tensor
 from theano.sandbox.rng_mrg import MRG_RandomStreams
 
+
 EPS = 1e-6
 TRNG = MRG_RandomStreams(seed=888)
+theano.config.floatX = 'float64'
 DTYPE = theano.config.floatX
 IDX_TYPE = 'int64'
 
@@ -19,18 +21,19 @@ def dtype_cast(data):
     return numpy.asarray(data, dtype=DTYPE)
 
 
-def unzip2list(zipped):
-    pass
-
-
 def dropout(state_before):
-    proj = tensor.switch(theano.shared(dtype_cast(0.)),
+    proj = tensor.switch(theano.shared(dtype_cast(1.)),
                          state_before * TRNG.binomial(state_before.shape, p=0.5, n=1, dtype=state_before.dtype),
                          state_before * 0.5)
     return proj
 
 
 def _get_random_weights(dim1, dim2, name=None):
+    w = numpy.random.randn(dim1, dim2)
+    return theano.shared(w.astype(DTYPE), name=name)
+
+
+def _get_gaussian_weights(dim1, dim2, name=None):
     w = numpy.random.randn(dim1, dim2)
     return theano.shared(w.astype(DTYPE), name=name)
 
@@ -76,14 +79,14 @@ class Core(object):
 
 class Dense(Core):
     def __init__(self, dim1, dim2):
-        Core.__init__(self, ['W', 'b'])
+        Core.__init__(self, ['mW', 'b'])
         self.dim1 = dim1
         self.dim2 = dim2
-        self.tparams['W'] = _get_random_weights(self.dim1, self.dim2, name='W')
+        self.tparams['mW'] = _get_gaussian_weights(self.dim1, self.dim2, name='mW')
         self.tparams['b'] = _get_zero_bias(self.dim2, name='b')
 
     def forward(self, state_below):
-        return tensor.dot(state_below, self.tparams['W']) + self.tparams['b']
+        return tensor.nnet.relu(tensor.dot(state_below, self.tparams['mW']) + self.tparams['b'])
 
 
 class WordEmbeddingLayer(Core):
@@ -94,6 +97,9 @@ class WordEmbeddingLayer(Core):
         self.tparams['E'] = _get_random_weights(vocab_size, embedding_dim, name='E')
 
     def forward(self, one_hot_input):
+        """
+        Input size: a one-hot vector or matrix, vocab_size * batch_size
+        """
         return tensor.dot(one_hot_input, self.tparams['E'])
 
 
@@ -234,4 +240,3 @@ class LSTMDecodeLayer(Core):
         h = mask[:, None] * h + (1. - mask)[:, None] * h_tm1
 
         return h, c
-        
