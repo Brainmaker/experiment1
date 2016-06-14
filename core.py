@@ -12,9 +12,10 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams
 
 EPS = 1e-6
 TRNG = MRG_RandomStreams(seed=888)
-theano.config.floatX = 'float64'
-DTYPE = theano.config.floatX
+theano.config.floatX = 'float32'
 IDX_TYPE = 'int64'
+DTYPE = theano.config.floatX
+USE_2_LAYERS = True
 
 
 def dtype_cast(data):
@@ -26,6 +27,21 @@ def dropout(state_before):
                          state_before * TRNG.binomial(state_before.shape, p=0.5, n=1, dtype=state_before.dtype),
                          state_before * 0.5)
     return proj
+
+
+def dropout_2(state_before, shape):
+    """
+    Dropout with inputs shape for LSTM decoder
+    Input: shape = state_before.shape
+    """
+    proj = tensor.switch(theano.shared(dtype_cast(1.)),
+                         state_before * TRNG.binomial(shape, p=0.5, n=1, dtype=state_before.dtype),
+                         state_before * 0.5)
+    return proj
+
+
+def cosine_similarity(a, b):
+    return tensor.dot(a, b) / (a.norm(L=2, axis=2) * a.norm(L=2, axis=2))
 
 
 def _get_random_weights(dim1, dim2, name=None):
@@ -52,6 +68,14 @@ def _slice_4(x, slice_tag, dim):
     if x.ndim == 3:
         return x[:, :, slice_tag * dim: (slice_tag + 1) * dim]
     return x[:, slice_tag * dim: (slice_tag + 1) * dim]
+
+
+class WordTable(object):
+    def __init__(self, word_table_path):
+        self.word_table = json.dumps(word_table_path)
+
+    def forward(self, word_idx):
+        pass
 
 
 class Core(object):
@@ -89,39 +113,33 @@ class Dense(Core):
         return tensor.nnet.relu(tensor.dot(state_below, self.tparams['mW']) + self.tparams['b'])
 
 
-class WordEmbeddingLayer(Core):
-    def __init__(self, embedding_dim, vocab_size):
+class WordEncodeLayer(Core):
+    def __init__(self, enc_dim, emb_dim):
         Core.__init__(self, ['E'])
-        self.embedding_dim = embedding_dim
-        self.vocab_size = vocab_size
-        self.tparams['E'] = _get_random_weights(vocab_size, embedding_dim, name='E')
+        self.enc_dim = enc_dim
+        self.emb_dim = emb_dim
+        self.tparams['E'] = _get_random_weights(emb_dim, enc_dim, name='E')
 
-    def forward(self, one_hot_input):
-        """
-        Input size: a one-hot vector or matrix, vocab_size * batch_size
-        """
-        return tensor.dot(one_hot_input, self.tparams['E'])
+    def forward(self, wemb_input):
+        return tensor.nnet.relu(tensor.dot(wemb_input, self.tparams['E']))
 
 
 class OutputLayer(Core):
-    def __init__(self, dec_dim, vocab_size):
+    def __init__(self, dec_dim, emb_dim):
         Core.__init__(self, ['U0', 'E0', 'C0', 'W0'])
         self.dec_dim = dec_dim
-        self.vocab_size = vocab_size
+        self.emb_dim = emb_dim
         self.tparams['U0'] = _get_random_weights(self.dec_dim, self.dec_dim, name='U0')
-        self.tparams['E0'] = _get_random_weights(self.vocab_size, self.dec_dim, name='E0')
+        self.tparams['E0'] = _get_random_weights(self.emb_dim, self.dec_dim, name='E0')
         self.tparams['C0'] = _get_random_weights(self.dec_dim, self.dec_dim, name='C0')
-        self.tparams['W0'] = _get_random_weights(self.dec_dim, self.vocab_size, name='W0')
+        self.tparams['W0'] = _get_random_weights(self.dec_dim, self.emb_dim, name='W0')
 
     def forward(self, y_tm1, h, context_vector):
-        t_bar = (tensor.dot(h, self.tparams['U0']) +
-                 tensor.dot(y_tm1, self.tparams['E0']) +
-                 tensor.dot(context_vector, self.tparams['C0']))
-        t = t_bar  # TODO: 2-maxout layer, the size of t_bar should be 2*dec_dim, here we use size(t_bar) = dec_dim
-        prob_y = tensor.nnet.softmax(tensor.dot(t, self.tparams['W0']))
-        y_idx = tensor.argmax(prob_y, axis=1)
-        y = theano.tensor.extra_ops.to_one_hot(y_idx, self.vocab_size, dtype=DTYPE)
-        return y, prob_y
+        t = tensor.nnet.relu(tensor.dot(h, self.tparams['U0']) +
+                             tensor.dot(y_tm1, self.tparams['E0']) +
+                             tensor.dot(context_vector, self.tparams['C0']))
+        y = tensor.dot(t, self.tparams['W0'])
+        return y
 
 
 class BiLSTMEncodeLayer(Core):
