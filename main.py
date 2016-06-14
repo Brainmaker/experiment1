@@ -3,12 +3,16 @@
 
 import os
 import sys
+import json
 import getopt
 
-from train import SAETrainer, DAETrainer
+from train import SGD, AdaDelta, SAETrainer, DAETrainer
 
 SHORT_ARGS = 'ht:m:'
 LONG_ARGS = ['help', 'test=', 'model=']
+
+sgd = SGD(lrate=0.35)
+adadelta = AdaDelta(lrate=0.1 ,rho=0.95)
 
 
 def usage():
@@ -26,18 +30,19 @@ Options:
 def test_sae():
     current_path = os.getcwd()
     sae_trainer = SAETrainer(
-        vocab_size='',
-        s_enc_dim='',
-        s_dec_dim='',
-        use_dropout='',
-        max_epochs='',
-        batch_size='',
-        lrate='',
-        momentum='',
-        dataset_path=current_path + '\\' + '',
-        vocabs_path=current_path + '\\' + '',
-        save_path=current_path + '\\' + '',
-        load_path=current_path + '\\' + ''
+        emb_dim=5,
+        s_enc_dim=3,
+        s_dec_dim=3,
+        use_dropout=True,
+        max_epochs=20,
+        batch_size=4,
+        optimizer=sgd,
+        dataset_path=current_path + '/' + 'sae_test_sample',
+        vocabs_path=current_path + '/' + 'test_vocabs.json',
+        word_table_path=current_path + '/' + 'test_word_table.json',
+        save_path=current_path + '/' + 'test_sae.json',
+        load_path=current_path + '/' + 'test_sae.json',
+        log_path=current_path + '/' + 'log.txt'
     )
     sae_trainer.train()
 
@@ -45,21 +50,22 @@ def test_sae():
 def test_dae():
     current_path = os.getcwd()
     dae_trainer = DAETrainer(
-        vocab_size='',
-        s_enc_dim='',
-        s_dec_dim='',
-        d_enc_dim='',
-        d_dec_dim='',
-        use_dropout='',
-        max_epochs='',
-        batch_size='',
-        lrate='',
-        momentum='',
-        dataset_path=current_path + '\\' + '',
-        vocabs_path=current_path + '\\' + '',
-        save_path=current_path + '\\' + '',
-        load_path=current_path + '\\' + '',
-        sae_load_path=current_path + '\\' + ''
+        emb_dim=5,
+        s_enc_dim=3,
+        s_dec_dim=3,
+        d_enc_dim=3,
+        d_dec_dim=3,
+        use_dropout=True,
+        max_epochs=5,
+        batch_size=4,
+        optimizer='',
+        dataset_path=current_path + '/' + 'dae_test_sample',
+        vocabs_path=current_path + '/' + 'test_vocabs.json',
+        word_table_path=current_path + '/' + 'test_word_table.json',
+        save_path=current_path + '/' + 'test_dae.json',
+        load_path=current_path + '/' + 'test_dae.json',
+        sae_load_path=current_path + '/' + 'test_sae.json',
+        log_path=current_path + '/' + 'log.txt'
     )
     dae_trainer.train()
 
@@ -67,18 +73,19 @@ def test_dae():
 def train_sae():
     current_path = os.getcwd()
     sae_trainer = SAETrainer(
-        vocab_size='',
-        s_enc_dim='',
-        s_dec_dim='',
-        use_dropout='',
-        max_epochs='',
-        batch_size='',
-        lrate='',
-        momentum='',
-        dataset_path=current_path + '\\' + '',
-        vocabs_path=current_path + '\\' + '',
-        save_path=current_path + '\\' + '',
-        load_path=current_path + '\\' + ''
+        emb_dim=50,
+        s_enc_dim=1000,
+        s_dec_dim=1000,
+        use_dropout=True,
+        max_epochs=10,
+        batch_size=128,
+        optimizer=sgd,
+        dataset_path=current_path + '/' + 'sentence_dataset',
+        vocabs_path=current_path + '/' + 'vocabs.json',
+        word_table_path=current_path + '/' + 'word_table.json',
+        save_path=current_path + '/' + 'trained_sae.json',
+        load_path=current_path + '/' + 'trained_sae.json',
+        log_path=current_path + '/' + 'log.txt'
     )
     sae_trainer.train()
 
@@ -86,21 +93,22 @@ def train_sae():
 def train_dae():
     current_path = os.getcwd()
     dae_trainer = DAETrainer(
-        vocab_size='',
-        s_enc_dim='',
-        s_dec_dim='',
-        d_enc_dim='',
-        d_dec_dim='',
-        use_dropout='',
-        max_epochs='',
-        batch_size='',
-        lrate='',
-        momentum='',
-        dataset_path=current_path + '\\' + '',
-        vocabs_path=current_path + '\\' + '',
-        save_path=current_path + '\\' + '',
-        load_path=current_path + '\\' + '',
-        sae_load_path=current_path + '\\' + ''
+        emb_dim=50,
+        s_enc_dim=1000,
+        s_dec_dim=1000,
+        d_enc_dim=1000,
+        d_dec_dim=1000,
+        use_dropout=True,
+        max_epochs=10,
+        batch_size=32,
+        optimizer=sgd,
+        dataset_path=current_path + '/' + 'document_dataset',
+        vocabs_path=current_path + '/' + 'vocabs.json',
+        word_table_path=current_path + '/' + 'word_table.json',
+        save_path=current_path + '/' + 'trained_dae.json',
+        load_path=current_path + '/' + 'trained_dae.json',
+        sae_load_path=current_path + '/' + 'trained_sae.json',
+        log_path=current_path + '/' + 'log.txt'
     )
     dae_trainer.train()
 
