@@ -8,14 +8,10 @@ import theano
 import theano.tensor as tensor
 from theano.tensor.nnet import categorical_crossentropy
 
-from core import EPS, DTYPE, USE_2_LAYERS
+from core import EPS, DTYPE, IDX_TYPE
+from submodule3 import (
+        WordEncoder, SentEncoder, WordDecoder, SentDecoder, MLP)
 
-if USE_2_LAYERS:
-    from submodule_2layers import (
-        WordEncoder, SentEncoder, WordDecoder, SentDecoder, MLP)
-else:
-    from submodule_4layers import (
-        WordEncoder, SentEncoder, WordDecoder, SentDecoder, MLP)
 
 
 class Module(object):
@@ -50,12 +46,12 @@ class SAE(Module):
         SAE的输入:
         x: 一个包含mini batch中所有句子的三维数组。每一列代表一个句子，每一行代表一个词。即一个timestep。
            其大小为 max_timestep * batch_size * vocab_size
-
         mask: 一个包含mini batch中所有句子mask的二维数组。每一列代表一个句子mask，每一行代表一个词mask。
               其大小为 max_timestep * batch_size
     """
-    def __init__(self, emb_dim, enc_dim, dec_dim, use_dropout):
+    def __init__(self, vocab_size, emb_dim, enc_dim, dec_dim, word_table, use_dropout):
         Module.__init__(self, ['word_enc', 'word_dec', 'mlp'])
+        self.vocab_size = vocab_size
         self.emb_dim = emb_dim
         self.enc_dim = enc_dim
         self.dec_dim = dec_dim
@@ -63,16 +59,14 @@ class SAE(Module):
 
         self.submodule['word_enc'] = WordEncoder(self.enc_dim, self.emb_dim, use_dropout=use_dropout)
         wemb_layer = self.submodule['word_enc'].layers['word_embedding']
-        self.submodule['word_dec'] = WordDecoder(self.dec_dim, self.emb_dim, wemb_layer, use_dropout=use_dropout)
+        self.submodule['word_dec'] = WordDecoder(self.dec_dim, self.emb_dim, self.vocab_size, wemb_layer, word_table, use_dropout=use_dropout)
         self.submodule['mlp'] = MLP(self.enc_dim * 2, self.dec_dim, use_dropout=use_dropout)
 
     @staticmethod
     def _cost(target_seq, pred_seq):
         pred_seq = tensor.clip(pred_seq, EPS, 1.0 - EPS)
-        # --- cosine similarity ---
-        cs = tensor.sum(target_seq * pred_seq, axis=2) / (target_seq.norm(L=2, axis=2) * pred_seq.norm(L=2, axis=2))
-        cost = cs.mean(axis=0).mean(axis=0)
-        return cost
+        cce = categorical_crossentropy(coding_dist=pred_seq, true_dist=target_seq).mean(axis=0).mean(axis=0)
+        return cce
 
     def get_context_vector(self, x, mask):
         s_emb = self.submodule['word_enc'].word_encode(x, mask)
@@ -80,29 +74,29 @@ class SAE(Module):
         return context_vector
 
     def decode(self, context_vector, mask):
-        pred_seq = self.submodule['word_dec'].decode(context_vector, mask)
-        return pred_seq
+        pred_seq, prob_pred_seq = self.submodule['word_dec'].decode(context_vector, mask)
+        return pred_seq, prob_pred_seq
 
     def forward(self, x, mask):
         context_vector = self.get_context_vector(x, mask)
-        pred_seq = self.decode(context_vector, mask)
-        return pred_seq
+        pred_seq, prob_pred_seq = self.decode(context_vector, mask)
+        return pred_seq, prob_pred_seq
 
     def compile(self, optimizer):
         """
         input_sents: max_sents_length * batch_size * vocab_size
         """
-        input_sents = tensor.tensor3('sents', dtype=DTYPE)
-        target_sents = input_sents
+        input_sents = tensor.tensor3('input_sents', dtype=DTYPE)
+        target_sents = tensor.tensor3('target_sents', dtype=IDX_TYPE) #TODO
         mask = tensor.matrix('mask', dtype=DTYPE)
 
-        pred_sents = self.forward(input_sents, mask)
-        cost = self._cost(target_sents, pred_sents)
+        pred_sents, pred_prob_sents = self.forward(input_sents, mask)
+        cost = self._cost(target_sents, pred_prob_sents)
 
         f_updates = theano.function(
             name    = 'f_s_updates',
-            inputs  = [input_sents, mask],
-            outputs = [pred_sents, cost],
+            inputs  = [input_sents, target_sents, mask],
+            outputs = [pred_prob_sents, cost],
             updates = optimizer(self.get_params(), cost)
         )
 
@@ -114,9 +108,7 @@ class DAE(Module):
         DAE的输入:
         x: 一个包含mini batch中所有文档的四维数组。对于前两个维而言，每一行代表一个timestep（即一个句子），每一列代表一个sample。
            其大小为 max_doc_length * batch_size * max_sent_length * vocab_size
-
         sent_mask: 大小为max_doc_length * batch_size * max_sent_length
-
         doc_mask: 大小为max_doc_length * batch_size
     """
     def __init__(self, enc_dim, dec_dim, sae, use_dropout):
@@ -205,7 +197,7 @@ class DAE(Module):
             name='f_d_updates',
             inputs=[input_docs, sent_mask, doc_mask],
             outputs=[pred_docs, cost],
-            updates=optimizer(self.get_params(), costf)
+            updates=optimizer(self.get_params(), cost)
         )
 
         return f_updates
