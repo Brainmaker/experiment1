@@ -12,14 +12,13 @@ SHORT_ARGS = 'ht:m:'
 LONG_ARGS = ['help', 'test=', 'model=']
 
 sgd = SGD(lrate=0.35)
-adadelta = AdaDelta(lrate=0.1 ,rho=0.95)
+adadelta = AdaDelta(lrate=1e-6 ,rho=0.95)
 
 
 def usage():
     print("""
 Usage:
   main [options]
-
 Options:
   -h, --help                             Show help
   -t <model name>, --test=<model name>   Run test sample
@@ -30,13 +29,14 @@ Options:
 def test_sae():
     current_path = os.getcwd()
     sae_trainer = SAETrainer(
+        vocab_size=21,
         emb_dim=5,
         s_enc_dim=3,
         s_dec_dim=3,
         use_dropout=True,
-        max_epochs=20,
+        max_epochs=2,
         batch_size=4,
-        optimizer=sgd,
+        optimizer=adadelta,
         dataset_path=current_path + '/' + 'sae_test_sample',
         vocabs_path=current_path + '/' + 'test_vocabs.json',
         word_table_path=current_path + '/' + 'test_word_table.json',
@@ -50,6 +50,7 @@ def test_sae():
 def test_dae():
     current_path = os.getcwd()
     dae_trainer = DAETrainer(
+        vocab_size=5,
         emb_dim=5,
         s_enc_dim=3,
         s_dec_dim=3,
@@ -73,11 +74,12 @@ def test_dae():
 def train_sae():
     current_path = os.getcwd()
     sae_trainer = SAETrainer(
+        vocab_size=100000,
         emb_dim=50,
-        s_enc_dim=1000,
-        s_dec_dim=1000,
+        s_enc_dim=1000, # or 500
+        s_dec_dim=1000, # or 500
         use_dropout=True,
-        max_epochs=10,
+        max_epochs=7,
         batch_size=128,
         optimizer=sgd,
         dataset_path=current_path + '/' + 'sentence_dataset',
@@ -93,6 +95,7 @@ def train_sae():
 def train_dae():
     current_path = os.getcwd()
     dae_trainer = DAETrainer(
+        vocab_size=5,
         emb_dim=50,
         s_enc_dim=1000,
         s_dec_dim=1000,
