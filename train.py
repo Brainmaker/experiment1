@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import json
+import cmath
 from collections import defaultdict, namedtuple
 
 import numpy
@@ -52,7 +53,9 @@ class SGD(Optimizer):
         self.lrate = lrate
 
     def optimize(self, params, cost):
-        return [(p, p - self.lrate * g) for p, g in zip(params, tensor.grad(cost=cost, wrt=params))]
+        grads = tensor.grad(cost=theano.gradient.grad_clip(cost, -10, 10), wrt=params)
+        #grads = tensor.grad(cost=cost, wrt=params)
+        return [(p, p - self.lrate * g) for p, g in zip(params, grads)]
 
 
 class AdaDelta(Optimizer):
@@ -62,7 +65,7 @@ class AdaDelta(Optimizer):
         self.rho = rho
 
     def optimize(self, params, cost):
-        grads = tensor.grad(cost, params)
+        grads = tensor.grad(cost=theano.gradient.grad_clip(cost, -10, 10), wrt=params)
         accus = [_shared_zeros_like(p.get_value()) for p in params]
         delta_accus = [_shared_zeros_like(p.get_value()) for p in params]
         updates = []
@@ -78,12 +81,13 @@ class AdaDelta(Optimizer):
 
 
 class Trainer(object):
-    def __init__(self, model, max_epochs, batch_size, optimizer,
+    def __init__(self, model, max_epochs, batch_size, optimizer, vocab_size,
                  dataset_path, vocabs_path, word_table_path, save_path, load_path, log_path):
         self.model = model
         self.max_epochs = max_epochs
         self.batch_size = batch_size
         self.optimizer = optimizer
+        self.vocab_size = vocab_size
         self.dataset_path = dataset_path
         self.vocabs_path = vocabs_path
         self.word_table_path = word_table_path
@@ -92,21 +96,24 @@ class Trainer(object):
         self.log_path = log_path
 
         with open(vocabs_path, 'r') as f:
-            self.vocabs = defaultdict(lambda : 0, json.loads(f.read()))
+            self.vocabs = defaultdict(lambda : 1, json.loads(f.read()))
 
         with open(word_table_path, 'r') as f:
-            self.word_table = numpy.array(json.loads(f.read()))
+            self.word_table = numpy.array(json.loads(f.read())).astype(dtype=DTYPE)
 
         if load_path and os.path.exists(load_path):
             model.load(load_path)
 
         print('Start compiling...')
         start_time = time.time()
-        self.f_update = model.compile(self.optimizer.optimize)
+        # self.f_update = model.compile(self.optimizer.optimize)
+        self.f_update = model.compile(optimizer.optimize)
         end_time = time.time()
         print('Compiling finished, compiling time: %s' % (end_time - start_time))
 
     def find_word_vec(self, x, n_samples, maxlen):pass
+
+    def to_one_hot(self, x):pass
 
     def prepare_data(self, dataset):pass
 
@@ -178,7 +185,7 @@ class Trainer(object):
 
 class SAETrainer(Trainer):
     def __init__(self,
-                 emb_dim, s_enc_dim, s_dec_dim, use_dropout,
+                 vocab_size, emb_dim, s_enc_dim, s_dec_dim, use_dropout,
                  max_epochs, batch_size, optimizer,
                  dataset_path='',
                  vocabs_path='',
@@ -187,13 +194,17 @@ class SAETrainer(Trainer):
                  load_path='',
                  log_path=''):
 
-        sae = SAE(emb_dim, s_enc_dim, s_dec_dim, use_dropout)
+        with open(word_table_path, 'r') as f:
+            word_table = numpy.array(json.loads(f.read())).astype(DTYPE)
+
+        sae = SAE(vocab_size, emb_dim, s_enc_dim, s_dec_dim, word_table, use_dropout)
 
         Trainer.__init__(self,
                          model=sae,
                          max_epochs=max_epochs,
                          batch_size=batch_size,
                          optimizer = optimizer,
+                         vocab_size=vocab_size,
                          dataset_path=dataset_path,
                          vocabs_path=vocabs_path,
                          word_table_path=word_table_path,
@@ -201,17 +212,17 @@ class SAETrainer(Trainer):
                          load_path=load_path,
                          log_path=log_path)
 
-    # def to_one_hot(self, x, vocab_size):
-    #     """
-    #     x: batch_size * max_sents_length
-    #     return: max_sents_length * batch_size * vocab_size
-    #     """
-    #     batch_size, max_sents_length = x.shape
-    #     onehot_x = numpy.zeros((batch_size, max_sents_length, vocab_size), dtype=IDX_TYPE)
-    #     for i in range(batch_size):
-    #         for j in range(max_sents_length):
-    #             onehot_x[i][j][x[i][j]-1] = 1
-    #     return onehot_x.swapaxes(1, 0)
+    def to_one_hot(self, x):
+        """
+        x: batch_size * max_sents_length
+        return: max_sents_length * batch_size * vocab_size
+        """
+        batch_size, max_sents_length = x.shape
+        onehot_x = numpy.zeros((batch_size, max_sents_length, self.vocab_size), dtype=IDX_TYPE)
+        for i in range(batch_size):
+            for j in range(max_sents_length):
+                onehot_x[i][j][x[i][j]] = 1
+        return onehot_x
 
     def find_word_vec(self, x, n_samples, maxlen):
         emb_dim = self.word_table.shape[1]
@@ -228,17 +239,19 @@ class SAETrainer(Trainer):
         for idx, val in enumerate(dataset):
             x[idx, :length[idx]] = val
             mask[idx, :length[idx]] = 1
-        x = self.word_table[x.flatten()].reshape((n_samples, maxlen, emb_dim)).astype(DTYPE)
-        return x.swapaxes(1, 0), mask.swapaxes(1, 0)
+        input_sents = self.word_table[x.flatten()].reshape((n_samples, maxlen, emb_dim)).astype(DTYPE)
+        target_sents = self.to_one_hot(x)
+        return input_sents.swapaxes(1, 0), target_sents.swapaxes(1, 0), mask.swapaxes(1, 0)
 
     def get_fupdate_rval(self, dataset, train_idx):
-        x, mask = self.prepare_data([dataset[i] for i in train_idx])
-        return self.f_update(x, mask)
+        input_sents, target_sents, mask = self.prepare_data([dataset[i] for i in train_idx])
+        rval = self.f_update(input_sents, target_sents, mask)
+        return rval
 
 
 class DAETrainer(Trainer):
     def __init__(self,
-                 emb_dim, s_enc_dim, s_dec_dim, d_enc_dim, d_dec_dim, use_dropout,
+                 vocab_size, emb_dim, s_enc_dim, s_dec_dim, d_enc_dim, d_dec_dim, use_dropout,
                  max_epochs, batch_size, optimizer,
                  dataset_path='',
                  vocabs_path='',
@@ -259,6 +272,7 @@ class DAETrainer(Trainer):
                          max_epochs=max_epochs,
                          batch_size=batch_size,
                          optimizer = optimizer,
+                         vocab_size=vocab_size,
                          dataset_path=dataset_path,
                          vocabs_path=vocabs_path,
                          word_table_path=word_table_path,
@@ -299,7 +313,6 @@ class DAETrainer(Trainer):
         n_samples = len(dataset)
         max_doc_length = max(length)
         max_sent_length = max([len(s[i])  for s in dataset for i in range(len(s))])
-        print(max_sent_length)
 
         sents_list, st_mask_list = _unzip([self._prepare_sentences_data(dataset[i], max_doc_length, max_sent_length)
                       for i in range(n_samples)])
